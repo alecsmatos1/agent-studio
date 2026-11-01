@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import { AlarmClock, AlarmClockOff, GitFork, Trash2 } from '@lucide/svelte';
+  import { AlarmClock, AlarmClockOff, GitFork, Pin, PinOff, Trash2 } from '@lucide/svelte';
 
   let {
     x,
@@ -15,6 +15,8 @@
     snooze,
     snoozed = false,
     snoozeDisabled = false,
+    pin,
+    pinned = false,
   }: {
     x: number;
     y: number;
@@ -30,6 +32,9 @@
     snooze?: () => void;
     snoozed?: boolean;
     snoozeDisabled?: boolean;
+    // Pins the chat to the top of its tab, or unpins it when `pinned`.
+    pin?: (event: MouseEvent) => void;
+    pinned?: boolean;
   } = $props();
   let menu: HTMLDivElement;
 
@@ -121,6 +126,12 @@
           size={15}
           aria-hidden="true"
         />Snooze{/if}</button
+    >{/if}
+  {#if pin}<button type="button" role="menuitem" tabindex="-1" onclick={pin}
+      >{#if pinned}<PinOff size={15} aria-hidden="true" />Unpin{:else}<Pin
+          size={15}
+          aria-hidden="true"
+        />Pin{/if}</button
     >{/if}
   <button class="danger" type="button" role="menuitem" tabindex="-1" onclick={remove}
     ><Trash2 size={15} aria-hidden="true" />{removeLabel}</button

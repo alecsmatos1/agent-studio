@@ -23,6 +23,7 @@ import { registerInstallation } from './fleet';
 import { sameFolderIcons } from './folder-icons';
 import { assignAccountColors, withAccountColor } from './account-colors';
 import { withSnooze, withoutSnooze } from './snoozes';
+import { withPin, withoutPin } from './pins';
 import { snapshotFor, type UsageSnapshot } from './usage';
 
 const chat = (): Conversation => ({
@@ -213,6 +214,33 @@ describe('workspace replication', () => {
     const saved = restoreWorkspace({ ...initialWorkspace(), snoozes: local.snoozes });
     expect(saved.snoozes).toEqual(local.snoozes);
     expect(sharedWorkspace(saved).snoozes).toEqual(local.snoozes);
+  });
+  it('syncs pins and keeps them when the relay predates them', () => {
+    const [kept, ours, theirs] = [chat(), chat(), chat()];
+    const at = new Date(2026, 10, 1);
+    const base = { ...emptyShared(), pins: withPin(undefined, kept.id, at) };
+    const local = { ...base, pins: withPin(base.pins, ours.id, at) };
+    const remote = { ...base, pins: withPin(base.pins, theirs.id, at) };
+    const merged = mergeShared(base, local, remote);
+    expect(merged.pins?.map((p) => p.conversationId)).toEqual([kept.id, ours.id, theirs.id].sort());
+    expect(sharedSchema.parse(merged).pins).toEqual(merged.pins);
+    // Unpinned on one device, the chat is unpinned on the other.
+    const unpinned = { ...local, pins: withoutPin(local.pins, kept.id) };
+    expect(mergeShared(local, unpinned, local).pins).toEqual(unpinned.pins);
+    expect(mergeShared(local, local, unpinned).pins).toEqual(unpinned.pins);
+    // An older relay drops the list; this device keeps its own and sees no difference.
+    const older = emptyShared();
+    expect(mergeShared(base, local, older).pins).toEqual(local.pins);
+    expect(sameShared(older, local)).toBe(true);
+    expect(sameShared(local, older)).toBe(false);
+    expect(sameShared(local, { ...local, pins: [...local.pins].reverse() })).toBe(true);
+    expect(sameMeta(metaOf(older), metaOf(local))).toBe(false);
+    expect(sameMeta(metaOf(unpinned), metaOf(local))).toBe(false);
+    // No list stays absent, as older relays store it, and a saved workspace keeps its pins.
+    expect('pins' in mergeShared(emptyShared(), emptyShared(), older)).toBe(false);
+    const saved = restoreWorkspace({ ...initialWorkspace(), pins: local.pins });
+    expect(saved.pins).toEqual(local.pins);
+    expect(sharedWorkspace(saved).pins).toEqual(local.pins);
   });
   it('migrates v2 and registers only this installation without inventing remote machines or accounts', () => {
     const old = {

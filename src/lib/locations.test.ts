@@ -9,6 +9,7 @@ import {
   historySectionId,
   knownLocations,
   locationConnections,
+  locationKey,
   loginIdentity,
   nextActiveConversation,
   rememberLocation,
@@ -613,6 +614,78 @@ describe('computer and folder chat scope', () => {
     expect(next('unknown')).toBeUndefined();
     const alone = groupConversations([chat('only')], workspace.fleet, installation);
     expect(nextActiveConversation(alone, 'only')).toBeUndefined();
+  });
+  it('lists pinned chats atop the tab they are in, the most recently pinned first', () => {
+    const { workspace, installation, location } = fixture();
+    ensureLocationConnections(workspace.fleet, location);
+    const chat = (title: string, place = location, archived = false): Conversation => ({
+      id: title,
+      settings: settingsFor(workspace.preferences),
+      location: place,
+      title,
+      createdAt: '',
+      updatedAt: '',
+      messages: [],
+      ...(archived ? { archived } : {}),
+    });
+    const other = { ...location, path: '/home/test/other' };
+    const conversations = [
+      chat('first'),
+      chat('pinned first'),
+      chat('second'),
+      chat('pinned other', other),
+      chat('pinned second'),
+      chat('pinned history', location, true),
+      chat('history', location, true),
+    ];
+    const pins = new Map(
+      [
+        ['pinned first', '2026-11-01T09:00:00.000Z'],
+        ['pinned other', '2026-11-01T10:00:00.000Z'],
+        ['pinned second', '2026-11-01T08:00:00.000Z'],
+        ['pinned history', '2026-11-01T11:00:00.000Z'],
+        // A pin whose chat has not arrived here yet lists nothing.
+        ['elsewhere', '2026-11-01T12:00:00.000Z'],
+      ].map(([id, at]) => [id, { at }]),
+    );
+    const groups = groupConversations(
+      conversations,
+      workspace.fleet,
+      installation,
+      [],
+      [],
+      Date.now(),
+      pins,
+    );
+    const [active, history] = groups;
+    // Pinned chats stay in their tab, leave their folder and keep their own folder's place.
+    expect(active.pinned.map((p) => [p.conversation.id, p.location?.path, p.folderId])).toEqual([
+      ['pinned other', other.path, locationKey(other)],
+      ['pinned first', location.path, locationKey(location)],
+      ['pinned second', location.path, locationKey(location)],
+    ]);
+    expect(
+      active.sections.flatMap((s) =>
+        s.folders.map((f) => [f.name, f.conversations.map((c) => c.id)]),
+      ),
+    ).toEqual([['project', ['first', 'second']]]);
+    expect(history.pinned.map((p) => p.conversation.id)).toEqual(['pinned history']);
+    expect(
+      history.sections.flatMap((s) => s.folders.flatMap((f) => f.conversations.map((c) => c.id))),
+    ).toEqual(['history']);
+    // Tabs still count every chat they hold.
+    expect([active.count, history.count]).toEqual([5, 2]);
+    // Leaving Active, a chat gives way to the next chat of its folder, the folder's pinned chats
+    // first in their order, never another folder's chat.
+    const next = (id: string) => nextActiveConversation(groups, id)?.id;
+    expect(next('pinned first')).toBe('pinned second');
+    expect(next('pinned second')).toBe('first');
+    expect(next('first')).toBe('second');
+    expect(next('second')).toBe('first');
+    expect(next('pinned other')).toBeUndefined();
+    expect(next('pinned history')).toBeUndefined();
+    // Without pins, nothing is pinned.
+    expect(groupConversations(conversations, workspace.fleet, installation)[0].pinned).toEqual([]);
   });
 
   it('syncs archiving and never loses a concurrent location or history edit during run reconciliation', () => {

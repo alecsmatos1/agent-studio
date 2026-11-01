@@ -1670,6 +1670,8 @@ test('sidebar deletion targets a History chat without opening it or clearing the
   await page.keyboard.press('ArrowDown');
   await expect(menu.getByRole('menuitem', { name: 'Snooze' })).toBeFocused();
   await page.keyboard.press('ArrowDown');
+  await expect(menu.getByRole('menuitem', { name: 'Pin' })).toBeFocused();
+  await page.keyboard.press('ArrowDown');
   await expect(menu.getByRole('menuitem', { name: 'Delete conversation' })).toBeFocused();
   await page.keyboard.press('Enter');
   const dialog = page.getByRole('alertdialog');

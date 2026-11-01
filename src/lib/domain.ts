@@ -41,6 +41,7 @@ import { appSessionsSchema } from './app-sessions.ts';
 import { folderIconsSchema } from './folder-icons.ts';
 import { accountColorsSchema } from './account-colors.ts';
 import { snoozesSchema } from './snoozes.ts';
+import { pinsSchema } from './pins.ts';
 import {
   workflowSchema,
   workflowProgressSchema,
@@ -349,6 +350,8 @@ export const workspaceSchema = z.object({
   accountColors: accountColorsSchema.optional(),
   // Chats snoozed until the desktop app starts again.
   snoozes: snoozesSchema.optional(),
+  // Chats pinned to the top of the Active or History tab they are in.
+  pins: pinsSchema.optional(),
 });
 export type Workspace = z.infer<typeof workspaceSchema>;
 export type ProviderStatus = {

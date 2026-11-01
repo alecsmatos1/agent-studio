@@ -844,9 +844,10 @@ test('a chat of yours becomes a static or dynamic workflow from its toolbar', as
   await expect(
     page.locator('.message').filter({ hasText: 'The demo needs a build and a page.' }),
   ).toBeVisible();
-  // The chat is the workflow's now: not one of the chats to move to History or snooze.
+  // The chat is the workflow's now: not one of the chats to move to History, snooze or pin.
   await expect(page.getByRole('button', { name: 'Move to history' })).toHaveCount(0);
   await expect(page.getByRole('button', { name: 'Snooze' })).toHaveCount(0);
+  await expect(page.getByRole('button', { name: 'Pin', exact: true })).toHaveCount(0);
   await expect(page.getByRole('button', { name: 'Make a workflow' })).toHaveCount(0);
   // The workflows list both; while it runs, it leads the Active list as a workflow, never as a
   // chat.

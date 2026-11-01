@@ -317,9 +317,17 @@ export function historySectionId(conversation: Conversation, timeline: SessionTi
   const day = new Date(used);
   return `day:${day.getFullYear()}-${day.getMonth() + 1}-${day.getDate()}`;
 }
+// A pinned chat, listed at the top of its tab with the folder it belongs to.
+export type PinnedChat = {
+  conversation: Conversation;
+  location?: ChatLocation;
+  // Its folder group's id, so the chat opened after it leaves Active stays in that folder.
+  folderId: string;
+};
 // Active conversations by computer and folder, and History ones by app session and folder.
 // Scratch chats, new conversations not sent yet, are listed in Active only: first in their
-// folder, and in folders of their own after the folders that hold conversations.
+// folder, and in folders of their own after the folders that hold conversations. Pinned chats
+// lead the tab they are in, the most recently pinned first, instead of their folder.
 export function groupConversations<S extends { computerId: string; location?: ChatLocation }>(
   conversations: Conversation[],
   fleet: Fleet,
@@ -327,6 +335,7 @@ export function groupConversations<S extends { computerId: string; location?: Ch
   scratches: S[] = [],
   appSessions: AppSession[] = [],
   now = Date.now(),
+  pins: ReadonlyMap<string, { at: string }> = new Map(),
 ) {
   const views = computerViews(fleet);
   const computerName = (id: string) =>
@@ -368,11 +377,27 @@ export function groupConversations<S extends { computerId: string; location?: Ch
       computers.set(id, (computer = { id, name: computerName(id), folders: new Map() }));
     return folderIn(computer.folders, location);
   };
+  const pinnedIn = (listed: Conversation[]): PinnedChat[] =>
+    listed
+      .filter((c) => pins.has(c.id))
+      .map((conversation) => {
+        const location = conversationLocation(conversation, fleet, installation);
+        return {
+          conversation,
+          location,
+          folderId: location ? locationKey(location) : 'unassigned',
+        };
+      })
+      .sort(
+        (a, b) =>
+          Date.parse(pins.get(b.conversation.id)!.at) - Date.parse(pins.get(a.conversation.id)!.at),
+      );
   const active = conversations.filter((c) => !c.archived);
   for (const conversation of active)
-    activeFolder(conversationLocation(conversation, fleet, installation)).conversations.push(
-      conversation,
-    );
+    if (!pins.has(conversation.id))
+      activeFolder(conversationLocation(conversation, fleet, installation)).conversations.push(
+        conversation,
+      );
   for (const scratch of scratches)
     activeFolder(scratchLocation(fleet, scratch)).scratches.push(scratch);
   const timeline = sessionTimeline(appSessions);
@@ -423,15 +448,17 @@ export function groupConversations<S extends { computerId: string; location?: Ch
   };
   const archived = conversations.filter((c) => c.archived);
   for (const conversation of archived)
-    folderIn(
-      sectionOf(conversation).folders,
-      conversationLocation(conversation, fleet, installation),
-    ).conversations.push(conversation);
+    if (!pins.has(conversation.id))
+      folderIn(
+        sectionOf(conversation).folders,
+        conversationLocation(conversation, fleet, installation),
+      ).conversations.push(conversation);
   return [
     {
       id: 'active',
       name: 'Active',
       count: active.length,
+      pinned: pinnedIn(active),
       sections: [...computers.values()].map((c): ConversationSection<S> => ({
         kind: 'computer',
         id: c.id,
@@ -443,6 +470,7 @@ export function groupConversations<S extends { computerId: string; location?: Ch
       id: 'history',
       name: 'History',
       count: archived.length,
+      pinned: pinnedIn(archived),
       sections: [...sections.values()]
         .sort((a, b) => b.at - a.at)
         .map(({ at, folders, ...section }): ConversationSection<S> => {
@@ -457,15 +485,24 @@ export function groupConversations<S extends { computerId: string; location?: Ch
   ];
 }
 // The Active conversation listed below `id` in its folder, else the one above it there, to open
-// when `id` leaves Active. Without one, its folder gets a new chat rather than another folder's
-// chat. Scratch chats are unsent drafts, not conversations, and are skipped.
+// when `id` leaves Active. A folder's pinned chats come first, in their order at the top of the
+// tab. Without one, its folder gets a new chat rather than another folder's chat. Scratch chats
+// are unsent drafts, not conversations, and are skipped.
 export function nextActiveConversation(
   groups: ReturnType<typeof groupConversations>,
   id: string,
 ): Conversation | undefined {
-  for (const section of groups.find((group) => group.id === 'active')?.sections ?? [])
-    for (const { conversations } of section.folders) {
-      const index = conversations.findIndex((c) => c.id === id);
-      if (index >= 0) return conversations[index + 1] ?? conversations[index - 1];
-    }
+  const active = groups.find((group) => group.id === 'active');
+  if (!active) return;
+  const folders = active.sections.flatMap((section) => section.folders);
+  const folderId =
+    active.pinned.find((pinned) => pinned.conversation.id === id)?.folderId ??
+    folders.find((folder) => folder.conversations.some((c) => c.id === id))?.id;
+  if (folderId === undefined) return;
+  const listed = [
+    ...active.pinned.filter((pinned) => pinned.folderId === folderId).map((p) => p.conversation),
+    ...folders.filter((folder) => folder.id === folderId).flatMap((folder) => folder.conversations),
+  ];
+  const index = listed.findIndex((c) => c.id === id);
+  return listed[index + 1] ?? listed[index - 1];
 }

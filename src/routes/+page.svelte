@@ -89,6 +89,7 @@
     CalendarDays,
     LayoutDashboard,
     AlarmClock,
+    Pin,
     MessageSquare,
     Zap,
     Workflow,
@@ -273,6 +274,7 @@
     historySectionId,
     nextActiveConversation,
     scratchLocation,
+    type PinnedChat,
   } from '$lib/locations';
   import {
     appSessionSchema,
@@ -297,6 +299,7 @@
     withSnooze,
     withoutSnooze,
   } from '$lib/snoozes';
+  import { pinIndex, withPin, withoutPin } from '$lib/pins';
   import {
     continueStep,
     continueText,
@@ -1695,6 +1698,8 @@
   });
   // History names session days, and a chat its days, from today, which moves on at midnight.
   let today = $state(startOfDay(Date.now()));
+  // Chats pinned to the top of the tab they are in, Active or History.
+  const pinsByChat = $derived(pinIndex(workspace.pins));
   const conversationGroups = $derived(
     groupConversations(
       recent,
@@ -1703,6 +1708,7 @@
       sidebarScratches,
       workspace.appSessions,
       today,
+      pinsByChat,
     ),
   );
   const iconsByFolder = $derived(folderIconIndex(workspace.folderIcons));
@@ -4910,6 +4916,10 @@
           .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt)),
         workspace.fleet,
         installation,
+        [],
+        [],
+        Date.now(),
+        pinsByChat,
       );
     const next = open
       ? (nextActiveConversation(conversationGroups, c.id) ??
@@ -5049,6 +5059,33 @@
         sidebarElement?.querySelector<HTMLElement>('.conversation-tabs [aria-selected="true"]')
       )?.focus();
     });
+  }
+  // Pins a chat to the top of the tab it is in, Active or History, or unpins it. Its place in
+  // Active or History stays as it is.
+  function togglePin(c: Conversation) {
+    if (!loaded) return;
+    const pins = $state.snapshot(workspace.pins);
+    workspace.pins = pinsByChat.has(c.id) ? withoutPin(pins, c.id) : withPin(pins, c.id);
+    saveSettingsSoon();
+  }
+  // The context menu's Pin and Unpin. The row moves between the pinned chats and its folder, and
+  // keyboard focus follows it, into view when the keyboard chose it.
+  function pinFromMenu(event: MouseEvent) {
+    const c = menuConversation,
+      trigger = conversationMenu?.trigger;
+    if (!c || !trigger) return;
+    const keyboard = event.detail === 0;
+    closeConversationMenu();
+    togglePin(c);
+    void tick().then(() =>
+      (
+        sidebarElement?.querySelector<HTMLElement>(
+          `.conversation-item[data-conversation="${c.id}"]`,
+        ) ??
+        (trigger.isConnected && trigger.getClientRects().length ? trigger : undefined) ??
+        sidebarElement?.querySelector<HTMLElement>('.conversation-tabs [aria-selected="true"]')
+      )?.focus({ preventScroll: !keyboard }),
+    );
   }
   // Chats the Claude Code and Codex CLIs saved on this computer, imported into History.
   let importOpen = $state(false);
@@ -5374,9 +5411,13 @@
       await cancelTitle(target.id).catch(() => {});
       if (session !== workspaceSession) return;
       workspace.conversations = workspace.conversations.filter((c) => c.id !== target.id);
-      // Its snooze goes with it.
+      // Its snooze and its pin go with it.
       if (snoozesByChat.has(target.id)) {
         workspace.snoozes = withoutSnooze($state.snapshot(workspace.snoozes), target.id, heldChat);
+        marks.meta();
+      }
+      if (pinsByChat.has(target.id)) {
+        workspace.pins = withoutPin($state.snapshot(workspace.pins), target.id);
         marks.meta();
       }
       // The saved order leaves it out, and a sync sees it gone from the baseline.
@@ -6941,6 +6982,83 @@
   }}
 />
 
+<!-- A chat's row in the sidebar. A pinned chat's row, atop its tab, shows its folder's icon. -->
+{#snippet conversationRow(c: Conversation, pinned?: PinnedChat)}{@const runningReply =
+    c.messages.find((m) => m.status === 'running')}{@const finished =
+    !runningReply && !!finishedChats[c.id]}{@const monitors = runningReply
+    ? 0
+    : runningMonitors(c.id)}{@const plan =
+    runningReply && runningPlanProgress(c.messages)}{@const snoozed =
+    snoozesByChat.has(c.id) && !!snoozeOf(c)}{@const notes = rowNotes(
+    finished,
+    monitors,
+    plan,
+    snoozed,
+  )}
+  <div class="conversation-row">
+    <button
+      class="conversation-item"
+      class:pinned-item={!!pinned}
+      class:current={activeId === c.id && view === 'chat'}
+      aria-current={activeId === c.id && view === 'chat' ? 'page' : undefined}
+      aria-haspopup="menu"
+      data-conversation={c.id}
+      oncontextmenu={(event) => openConversationMenu(event, c.id)}
+      onkeydown={(event) => {
+        if (event.key === 'ContextMenu' || (event.shiftKey && event.key === 'F10'))
+          openConversationMenu(event, c.id);
+      }}
+      onpointerdown={(event) => startTouchMenu(event, c.id)}
+      onpointermove={moveTouchMenu}
+      onpointerup={cancelTouchMenu}
+      onpointercancel={cancelTouchMenu}
+      onclick={(event) => {
+        if (longPressedConversation === c.id) {
+          event.preventDefault();
+          longPressedConversation = undefined;
+        } else openConversation(c);
+      }}
+      title={[c.title, ...notes].join(' · ')}
+      aria-label={notes.length
+        ? [c.title, ...notes.map((note) => note.toLowerCase())].join(', ')
+        : undefined}
+      >{#if finished}<i class="conversation-finished" aria-hidden="true"
+        ></i>{:else if pinned?.location?.path}<FolderIcon
+          icon={folderIconOf(iconsByFolder, pinned.location)?.icon}
+          size={13}
+        />{:else if pinned}<MessageCircle size={13} aria-hidden="true" />{/if}<span>{c.title}</span
+      >{#if plan}<small class="conversation-plan" aria-hidden="true"
+          >{plan.count}/{plan.total}</small
+        >{/if}{#if runningReply && awaitingAnswer(runningReply)}<MessageCircleQuestionMark
+          size={14}
+          class="conversation-waiting"
+          aria-hidden="true"
+        />{:else if runningReply}{@const started = Date.parse(
+          runningReply.createdAt,
+        )}{#if Number.isFinite(started)}<span class="conversation-running" aria-hidden="true"
+            >{toolElapsed(Math.max(0, clock.now - started))}</span
+          >{:else}<LoaderCircle
+            size={14}
+            class="spinning conversation-running"
+            aria-hidden="true"
+          />{/if}{:else if monitors}<Activity
+          size={14}
+          class="conversation-monitoring"
+          aria-hidden="true"
+        />{:else if snoozed}<AlarmClock
+          size={14}
+          class="conversation-snoozed"
+          aria-hidden="true"
+        />{/if}</button
+    >{#if !c.archived && !conversationRunning(c)}<button
+        class="conversation-archive"
+        title="Move to history"
+        aria-label={`Move ${c.title} to history`}
+        onclick={(event) => archiveRow(event, c)}><Archive size={14} aria-hidden="true" /></button
+      >{/if}
+  </div>
+{/snippet}
+
 {#if !desktop() && !paired}
   <WorkspaceLogin
     checking={(!loaded || relayRestorePending) && !storageError && !syncError}
@@ -7247,6 +7365,20 @@
                 </div>
               {/each}
             </section>{/if}
+          {#if group.pinned.length}<section
+              class="pinned-chats"
+              aria-labelledby={`pinned-heading-${group.id}`}
+            >
+              <h2 id={`pinned-heading-${group.id}`} class="snoozed-heading">
+                <Pin size={13} aria-hidden="true" />Pinned
+              </h2>
+              <div class="pinned-conversations">
+                {#each group.pinned as pinned (pinned.conversation.id)}{@render conversationRow(
+                    pinned.conversation,
+                    pinned,
+                  )}{/each}
+              </div>
+            </section>{/if}
           {#each group.sections as section}
             {@const sectionKey = `${group.id}/${section.id}`}
             <div
@@ -7370,87 +7502,12 @@
                               ><Archive size={14} aria-hidden="true" /></button
                             >
                           </div>{/each}
-                        {#each folder.conversations as c}{@const runningReply = c.messages.find(
-                            (m) => m.status === 'running',
-                          )}{@const finished = !runningReply && !!finishedChats[c.id]}{@const monitors =
-                            runningReply ? 0 : runningMonitors(c.id)}{@const plan =
-                            runningReply && runningPlanProgress(c.messages)}{@const snoozed =
-                            snoozesByChat.has(c.id) && !!snoozeOf(c)}{@const notes = rowNotes(
-                            finished,
-                            monitors,
-                            plan,
-                            snoozed,
-                          )}
-                          <div class="conversation-row">
-                            <button
-                              class="conversation-item"
-                              class:current={activeId === c.id && view === 'chat'}
-                              aria-current={activeId === c.id && view === 'chat'
-                                ? 'page'
-                                : undefined}
-                              aria-haspopup="menu"
-                              oncontextmenu={(event) => openConversationMenu(event, c.id)}
-                              onkeydown={(event) => {
-                                if (
-                                  event.key === 'ContextMenu' ||
-                                  (event.shiftKey && event.key === 'F10')
-                                )
-                                  openConversationMenu(event, c.id);
-                              }}
-                              onpointerdown={(event) => startTouchMenu(event, c.id)}
-                              onpointermove={moveTouchMenu}
-                              onpointerup={cancelTouchMenu}
-                              onpointercancel={cancelTouchMenu}
-                              onclick={(event) => {
-                                if (longPressedConversation === c.id) {
-                                  event.preventDefault();
-                                  longPressedConversation = undefined;
-                                } else openConversation(c);
-                              }}
-                              title={[c.title, ...notes].join(' · ')}
-                              aria-label={notes.length
-                                ? [c.title, ...notes.map((note) => note.toLowerCase())].join(', ')
-                                : undefined}
-                              >{#if finished}<i class="conversation-finished" aria-hidden="true"
-                                ></i>{/if}<span>{c.title}</span
-                              >{#if plan}<small class="conversation-plan" aria-hidden="true"
-                                  >{plan.count}/{plan.total}</small
-                                >{/if}{#if runningReply && awaitingAnswer(runningReply)}<MessageCircleQuestionMark
-                                  size={14}
-                                  class="conversation-waiting"
-                                  aria-hidden="true"
-                                />{:else if runningReply}{@const started = Date.parse(
-                                  runningReply.createdAt,
-                                )}{#if Number.isFinite(started)}<span
-                                    class="conversation-running"
-                                    aria-hidden="true"
-                                    >{toolElapsed(Math.max(0, clock.now - started))}</span
-                                  >{:else}<LoaderCircle
-                                    size={14}
-                                    class="spinning conversation-running"
-                                    aria-hidden="true"
-                                  />{/if}{:else if monitors}<Activity
-                                  size={14}
-                                  class="conversation-monitoring"
-                                  aria-hidden="true"
-                                />{:else if snoozed}<AlarmClock
-                                  size={14}
-                                  class="conversation-snoozed"
-                                  aria-hidden="true"
-                                />{/if}</button
-                            >{#if !c.archived && !conversationRunning(c)}<button
-                                class="conversation-archive"
-                                title="Move to history"
-                                aria-label={`Move ${c.title} to history`}
-                                onclick={(event) => archiveRow(event, c)}
-                                ><Archive size={14} aria-hidden="true" /></button
-                              >{/if}
-                          </div>{/each}
+                        {#each folder.conversations as c}{@render conversationRow(c)}{/each}
                       </div>{/if}
                   </div>
                 {/each}{/if}
             </div>
-          {:else}{#if group.id !== 'active' || (!listedSnoozes.length && !listedRuns.length)}<SidebarEmpty
+          {:else}{#if !group.pinned.length && (group.id !== 'active' || (!listedSnoozes.length && !listedRuns.length))}<SidebarEmpty
                 icon={query ? SearchX : group.id === 'active' ? MessageSquare : HistoryIcon}
                 title={query
                   ? 'No matches'
@@ -7841,6 +7898,14 @@
                   onclick={toggleOpenSnooze}
                   title={snoozed ? 'Cancel snooze' : 'Snooze until the app restarts'}
                   aria-label="Snooze"><AlarmClock size={16} /></button
+                >{/if}
+              {#if active && !readOnlyChat && !chatWorkflow}{@const chat = active}{@const pinned =
+                  pinsByChat.has(chat.id)}<button
+                  class="icon-button pin-toggle"
+                  aria-pressed={pinned}
+                  onclick={() => togglePin(chat)}
+                  title={pinned ? 'Unpin' : 'Pin'}
+                  aria-label="Pin"><Pin size={16} /></button
                 >{/if}
               {#if workflowFromChatShown && active}{@const chat = active}<div class="workflow-from-chat">
                   <button
@@ -8594,6 +8659,8 @@
       snooze={snoozeFromMenu}
       snoozed={!!snoozeOf(menuConversation)}
       snoozeDisabled={conversationRunning(menuConversation)}
+      pin={pinFromMenu}
+      pinned={pinsByChat.has(menuConversation.id)}
     />
   {/key}
 {:else if conversationMenu && menuScratch}

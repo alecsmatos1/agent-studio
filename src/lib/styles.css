@@ -602,8 +602,7 @@ pre {
   flex-direction: column;
   gap: 1px;
 }
-.running-workflows + .snoozed-chats,
-.running-workflows + .conversation-computer {
+.running-workflows + :is(.snoozed-chats, .pinned-chats, .conversation-computer) {
   margin-top: 14px;
 }
 .workflow-run-item > svg:first-child {
@@ -623,8 +622,28 @@ pre {
   flex-direction: column;
   gap: 4px;
 }
-.snoozed-chats + .conversation-computer {
+.snoozed-chats + :is(.pinned-chats, .conversation-computer) {
   margin-top: 14px;
+}
+/* Pinned chats lead the tab they are in, Active or History, above its computers or sessions,
+   each row with its folder's icon in its gutter. */
+.pinned-chats + :is(.conversation-computer, .conversation-session) {
+  margin-top: 14px;
+}
+.pinned-conversations {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+.conversation-item.pinned-item > svg:first-child {
+  position: absolute;
+  left: 10px;
+  top: 50%;
+  margin-top: -6.5px;
+  color: var(--text-faint);
+}
+.conversation-item.pinned-item.current > svg:first-child {
+  color: var(--text-secondary);
 }
 .snoozed-heading {
   display: flex;
@@ -1344,12 +1363,12 @@ pre {
   background: var(--selected);
   color: var(--text);
 }
-/* The toolbar's Snooze stays pressed while the open chat is snoozed. */
-.icon-button.snooze-toggle[aria-pressed='true'] {
+/* The toolbar's Snooze and Pin stay pressed while the open chat is snoozed or pinned. */
+.icon-button:is(.snooze-toggle, .pin-toggle)[aria-pressed='true'] {
   background: var(--accent-soft);
   color: var(--accent-text);
 }
-.icon-button.snooze-toggle[aria-pressed='true']:not(:disabled):hover {
+.icon-button:is(.snooze-toggle, .pin-toggle)[aria-pressed='true']:not(:disabled):hover {
   background: var(--accent-soft-hover);
   color: var(--accent-hover);
 }

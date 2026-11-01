@@ -172,6 +172,7 @@ test('Open shows the chat in History, and a message brings it back to Active', a
   await expect(menu.getByRole('menuitem')).toHaveText([
     'Fork conversation',
     'Snooze',
+    'Pin',
     'Delete conversation',
   ]);
   await expect(menu.getByRole('menuitem', { name: 'Snooze' })).toHaveAttribute(
