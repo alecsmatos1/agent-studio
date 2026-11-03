@@ -16,6 +16,17 @@ function Cost([decimal]$amount) {
 }
 $open = $false
 $agent = $false
+# The callbacks the host registered for compactions, which the CLI calls together after each
+# summary, keeping their answers in order.
+$compactHooks = @()
+function CompactHook {
+    $n = 0
+    foreach ($id in $script:compactHooks) {
+        [Console]::WriteLine('{"type":"control_request","request_id":"compact-hook-' + $n + '","request":{"subtype":"hook_callback","callback_id":"' + $id + '","input":{"hook_event_name":"SessionStart","source":"compact","session_id":"' + $env:STUDIO_TEST_SESSION + '"},"tool_use_id":null}}')
+        $n += 1
+    }
+    foreach ($id in $script:compactHooks) { Add-Content -LiteralPath $settingsLog -Value ([Console]::ReadLine()) }
+}
 while ($null -ne ($line = [Console]::ReadLine())) {
     $value = $line | ConvertFrom-Json
     $settingsLog = Join-Path (Split-Path $PSCommandPath) 'settings.jsonl'
@@ -33,6 +44,9 @@ while ($null -ne ($line = [Console]::ReadLine())) {
         continue
     }
     if ($value.type -eq 'control_request' -and $value.request.subtype -eq 'initialize') {
+        foreach ($matcher in @($value.request.hooks.SessionStart)) {
+            if ($matcher.matcher -eq 'compact') { $compactHooks = @($matcher.hookCallbackIds) }
+        }
         [Console]::WriteLine('{"type":"control_response","response":{"subtype":"success","request_id":"' + $value.request_id + '"}}')
         continue
     }
@@ -65,6 +79,7 @@ while ($null -ne ($line = [Console]::ReadLine())) {
             [Console]::WriteLine('{"type":"system","subtype":"status","status":"compacting"}')
             if ($value.message.content[0].text -ne '/compact missing') {
                 [Console]::WriteLine('{"type":"system","subtype":"compact_boundary","uuid":"boundary","compact_metadata":{"trigger":"manual","pre_tokens":90000,"post_tokens":5000}}')
+                CompactHook
             }
             [Console]::WriteLine('{"type":"result","subtype":"success","is_error":false,"num_turns":0,"result":""}')
             continue
@@ -94,6 +109,15 @@ while ($null -ne ($line = [Console]::ReadLine())) {
             [Console]::WriteLine('{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","resetsAt":1759254600,"rateLimitType":"five_hour"},"uuid":"limit-event","session_id":"' + $env:STUDIO_TEST_SESSION + '"}')
             [Console]::WriteLine('{"type":"assistant","parent_tool_use_id":null,"error":"rate_limit","is_api_error_message":true,"message":{"id":"b5b9d6d0-8fe4-4efb-a83a-4c65d0b3ef48","model":"<synthetic>","role":"assistant","usage":{"input_tokens":0,"output_tokens":0},"content":[{"type":"text","text":"You''ve hit your session limit \u00b7 resets 1:50pm (America/Sao_Paulo)"}]}}')
             [Console]::WriteLine('{"type":"result","subtype":"success","is_error":true,"num_turns":2,"result":"You''ve hit your session limit \u00b7 resets 1:50pm (America/Sao_Paulo)","usage":{"input_tokens":40,"output_tokens":2},"total_cost_usd":' + (Cost 0.001d) + '}')
+            continue
+        }
+        if ($mode -eq 'Compacting') {
+            # The context fills up mid-reply: the CLI compacts it and goes on with the summary.
+            [Console]::WriteLine('{"type":"system","subtype":"status","status":"compacting"}')
+            [Console]::WriteLine('{"type":"system","subtype":"compact_boundary","uuid":"auto-boundary","compact_metadata":{"trigger":"auto","pre_tokens":967000,"post_tokens":14000}}')
+            CompactHook
+            [Console]::WriteLine('{"type":"assistant","parent_tool_use_id":null,"message":{"id":"after","model":"fixture-model","content":[{"type":"text","text":"Compacted and done."}],"usage":{"input_tokens":3,"output_tokens":1}}}')
+            [Console]::WriteLine('{"type":"result","subtype":"success","is_error":false,"num_turns":1,"result":"Compacted and done.","usage":{"input_tokens":3,"output_tokens":1}}')
             continue
         }
         if ($mode -eq 'Refused') {
@@ -302,6 +326,94 @@ async fn a_refused_tool_hears_of_planning_only_while_the_cli_reports_plan_mode()
         assert!(answers[1].contains("While planning"), "{answers:?}");
         assert!(answers[2].contains("Dangerous rm operation"), "{answers:?}");
         assert!(!answers[2].contains("planning"), "{answers:?}");
+    }
+}
+
+/// The guidance a compaction's hooks gave, their pieces in order, from what the fixture read.
+fn compaction_answer(root: &std::path::Path) -> Option<String> {
+    let mut answers: Vec<(usize, Option<String>)> = settings_input(root)
+        .into_iter()
+        .filter_map(|line| {
+            let id = line["response"]["request_id"].as_str()?;
+            let n = id.strip_prefix("compact-hook-")?.parse().ok()?;
+            assert_eq!(line["response"]["subtype"], "success");
+            let output = &line["response"]["response"]["hookSpecificOutput"];
+            let context = output["additionalContext"].as_str().map(|context| {
+                assert_eq!(output["hookEventName"], "SessionStart");
+                assert!(context.encode_utf16().count() <= 10_000);
+                context.to_owned()
+            });
+            Some((n, context))
+        })
+        .collect();
+    if answers.is_empty() {
+        return None;
+    }
+    answers.sort_by_key(|(n, _)| *n);
+    assert_eq!(answers.len(), 20, "Every registered hook is answered");
+    // Pieces come first, and the hooks after the last piece have nothing to add.
+    let given = answers
+        .iter()
+        .take_while(|(_, context)| context.is_some())
+        .count();
+    assert!(answers[given..]
+        .iter()
+        .all(|(_, context)| context.is_none()));
+    Some(
+        answers
+            .into_iter()
+            .filter_map(|(_, context)| context)
+            .collect::<Vec<_>>()
+            .join("\n\n"),
+    )
+}
+
+#[tokio::test]
+async fn a_compaction_hears_again_the_guidance_and_instructions_its_summary_replaced() {
+    let root = tempfile::tempdir().unwrap();
+    let conversation = uuid::Uuid::new_v4().to_string();
+    let mut request = request(
+        root.path(),
+        &conversation,
+        serde_json::json!([{"role":"user","text":"Compacting"}]),
+    );
+    request.agent.instructions = "Answer in French.".into();
+    let session = request.native_session.as_ref().unwrap().id().to_string();
+    let mut process = fixture(root.path(), &session, false, false);
+    let (result, events) = turn(
+        &mut process,
+        &request,
+        CancellationToken::new(),
+        false,
+        false,
+    )
+    .await;
+    assert!(process.alive() && process.healthy);
+    process.kill().await;
+    assert_eq!(
+        result.unwrap(),
+        ("complete".into(), "Compacted and done.".into())
+    );
+    assert!(events
+        .iter()
+        .any(|e| matches!(e, RunEvent::Compaction{compaction} if compaction.status == "complete")));
+    let init = settings_input(root.path())
+        .into_iter()
+        .find(|line| line["request"]["subtype"] == "initialize")
+        .unwrap();
+    assert_eq!(
+        init["request"]["hooks"],
+        crate::providers::after_compaction::hooks()
+    );
+    let context = compaction_answer(root.path()).expect("the hook was answered");
+    for expected in [
+        "Agent Studio",
+        "mcp__agent_studio__send_files",
+        "mcp__agent_studio__compare_files",
+        "mcp__agent_studio__visualize",
+        "Current user instructions for this conversation:\nAnswer in French.",
+    ] {
+        assert!(context.contains(expected), "{expected} in {context}");
     }
 }
 
@@ -1051,10 +1163,15 @@ async fn manual_compaction_requires_a_boundary_and_keeps_the_native_process() {
             assert!(events.iter().any(
                 |e| matches!(e, RunEvent::Compaction{compaction} if compaction.status == "complete")
             ));
+            // The hook the first reply's process registered is answered by this one.
+            assert!(compaction_answer(root.path())
+                .unwrap()
+                .contains("mcp__agent_studio__send_files"));
         } else {
             assert!(result
                 .unwrap_err()
                 .contains("without confirming compaction"));
+            assert!(compaction_answer(root.path()).is_none());
         }
         process.kill().await;
     }

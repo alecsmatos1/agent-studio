@@ -760,7 +760,13 @@ async fn stream_turn(
         }
         prompt_sent = settings.advance(process, &prompt).await?;
     } else {
-        process.stdin.write_all(b"{\"type\":\"control_request\",\"request_id\":\"studio-init\",\"request\":{\"subtype\":\"initialize\",\"hooks\":null}}\n").await.map_err(|_| send_failed)?;
+        // The process keeps these hooks for every later reply, each answering them as it runs.
+        let init = serde_json::json!({"type":"control_request","request_id":"studio-init","request":{"subtype":"initialize","hooks":crate::providers::after_compaction::hooks()}});
+        process
+            .stdin
+            .write_all(format!("{init}\n").as_bytes())
+            .await
+            .map_err(|_| send_failed)?;
     }
     let mut decoder = Decoder::default();
     decoder.cost_baseline = process.cost_total;
@@ -774,6 +780,8 @@ async fn stream_turn(
             request.mission.is_some(),
         ),
     );
+    // What a compaction hears again, worked out once its hooks ask (`after_compaction`).
+    let mut compaction_guidance = crate::providers::after_compaction::Guidance::default();
     let mut sender = crate::providers::sent_files::FileSender::default();
     let mut published = crate::providers::published_artifacts::PublishedArtifacts::default();
     let mut screen_tools = crate::screens::tools::Agent::default();
@@ -951,7 +959,7 @@ async fn stream_turn(
                                 let discovery = value["request"]["subtype"] == "mcp_message"
                                     && value["request"]["server_name"] == "agent_studio"
                                     && matches!(value["request"]["message"]["method"].as_str(), Some("initialize" | "notifications/initialized" | "ping" | "tools/list"));
-                                let response = if discovery { visualizer.claude_response(&value) } else {
+                                let response = if let Some(answer) = compaction_guidance.answer(&value, || request.compaction_context()) { answer } else if discovery { visualizer.claude_response(&value) } else {
                                     serde_json::json!({"type":"control_response","response":{"subtype":"error","request_id":value["request_id"],"error":"Unavailable while applying next-reply settings"}})
                                 };
                                 process.stdin.write_all(format!("{response}\n").as_bytes()).await.map_err(|_| send_failed)?;
@@ -1026,6 +1034,11 @@ async fn stream_turn(
                             for event in screen_tools.observe_claude(&value) { if let Some(channel) = channel { if channel.send(event).is_err() { cancel.cancel(); } } }
                             if let Some(q) = &mut questions { q.workflow.observe_claude(&value); }
                             if value["type"] == "control_request" {
+                                // A compaction, automatic or /compact, asks for the guidance its summary replaced.
+                                if let Some(answer) = compaction_guidance.answer(&value, || request.compaction_context()) {
+                                    process.stdin.write_all(format!("{answer}\n").as_bytes()).await.map_err(|_| send_failed)?;
+                                    continue;
+                                }
                                 let own_session = value["session_id"].is_null() || value["session_id"].as_str() == Some(process.session_id.as_str());
                                 if let Some(response) = questions.as_mut().and_then(|q| q.claude_plan(&value, initialized && prompt_sent && !interrupting && !request.compact && own_session)) {
                                     if let Some(response) = response { process.stdin.write_all(format!("{response}\n").as_bytes()).await.map_err(|_| send_failed)?; }

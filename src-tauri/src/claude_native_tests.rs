@@ -1800,3 +1800,138 @@ async fn installed_claude_answers_workflow_tools_through_the_window() {
     assert!(answer.contains("Probe mission"), "{answer}");
     eprintln!("Tools {names:?}; answer: {answer}");
 }
+
+/// One reply of a chat on a process the test keeps, as a parked process serves later replies.
+async fn reply_on(
+    process: &mut crate::pool::Process,
+    request: &RunRequest,
+    reused: bool,
+) -> (String, String) {
+    let (tx, mut received) = tokio::sync::mpsc::unbounded_channel();
+    let channel = EventSink::new(move |event| {
+        let _ = tx.send(event);
+        Ok(())
+    });
+    let mut questions = Questions::default()
+        .open(&request.run_id, None, channel.clone())
+        .unwrap();
+    let result = tokio::time::timeout(
+        Duration::from_secs(300),
+        stream_turn(
+            process,
+            request,
+            Some(&channel),
+            CancellationToken::new(),
+            Some(&mut questions),
+            reused,
+        ),
+    )
+    .await
+    .expect("Installed CLI test timed out");
+    drop(channel);
+    while received.try_recv().is_ok() {}
+    result.expect("Installed CLI failed")
+}
+
+/// Claude Code compacts a chat by putting a summary in place of its messages, which keeps the
+/// guidance only the first message carried by chance. The compaction hook gives it back: after
+/// /compact the transcript holds the hook's answer after the boundary, and the model still
+/// knows which tool shows the user a file.
+#[tokio::test]
+#[ignore = "Opt-in installed Claude CLI test; uses subscription capacity."]
+async fn installed_claude_hears_the_guidance_again_after_a_compaction() {
+    let folder = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let runtime = root.path().join("chat-runtime");
+    std::fs::create_dir_all(&runtime).unwrap();
+    let exe = crate::providers::resolve("claude").await.unwrap();
+    let profile = crate::context::native_profile_root("claude").await.unwrap();
+    let cwd = folder.path().to_string_lossy().into_owned();
+    let conversation = uuid::Uuid::new_v4().to_string();
+    let (computer, environment) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+    let request = |messages: &serde_json::Value, compact: bool| -> RunRequest {
+        let mut request: RunRequest = serde_json::from_value(
+            json!({"runId":uuid::Uuid::new_v4(),"conversationId":conversation,"compact":compact,
+            "location":{"computerId":computer,"environmentId":environment,"path":cwd},
+            "agent":{"provider":"claude","model":"haiku","instructions":""},"messages":messages}),
+        )
+        .unwrap();
+        request.native_session =
+            crate::providers::sessions::Session::prepare(root.path(), &request).unwrap();
+        request
+    };
+    let mut messages = json!([{"role":"user","text":"Reply only OK."}]);
+    let first = request(&messages, false);
+    let session = first.native_session.as_ref().unwrap().id().to_string();
+    let mut command = crate::providers::chat_command(&first, &runtime, &exe)
+        .await
+        .unwrap();
+    let mut process = crate::pool::Process::new(
+        exe.clone(),
+        command.spawn().unwrap(),
+        "compaction".into(),
+        session.clone(),
+    )
+    .unwrap();
+    let (status, text) = reply_on(&mut process, &first, false).await;
+    assert_eq!(status, "complete");
+    drop(first);
+    messages.as_array_mut().unwrap().extend([
+        json!({"role":"assistant","text":text}),
+        json!({"role":"user","text":"/compact"}),
+    ]);
+    let compact = request(&messages, true);
+    let (status, text) = reply_on(&mut process, &compact, true).await;
+    assert_eq!(
+        (status.as_str(), text.as_str()),
+        ("complete", "Context compacted.")
+    );
+    drop(compact);
+    messages.as_array_mut().unwrap().extend([
+        json!({"role":"assistant","text":text}),
+        json!({"role":"user","text":"Without calling any tool, reply with only the full name of the tool this conversation's guidance says to call to show the user an image file."}),
+    ]);
+    let question = request(&messages, false);
+    let (status, answer) = reply_on(&mut process, &question, true).await;
+    process.kill().await;
+    drop(question);
+    let transcript = crate::native_instructions::find_record(&profile, "claude", &session)
+        .unwrap()
+        .expect("The session saved its transcript");
+    let lines = std::fs::read_to_string(&transcript).unwrap();
+    let after = lines
+        .rsplit_once("\"subtype\":\"compact_boundary\"")
+        .expect("The transcript records the compaction")
+        .1;
+    // Claude Code keeps the hooks' contexts as one attachment, each whole in the conversation.
+    let heard: Vec<String> = after
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .find(|line| {
+            line["attachment"]["type"] == "hook_additional_context"
+                && line["attachment"].to_string().contains("Agent Studio")
+        })
+        .map(|line| {
+            line["attachment"]["content"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|entry| entry.as_str().unwrap().to_owned())
+                .collect()
+        })
+        .unwrap_or_default();
+    let sizes: Vec<usize> = heard.iter().map(|entry| entry.chars().count()).collect();
+    eprintln!("After the boundary: pieces of {sizes:?}; answer: {answer}");
+    // The project folder named after the throwaway folder holds only this test's files.
+    std::fs::remove_dir_all(transcript.parent().unwrap()).unwrap();
+    assert_eq!(status, "complete");
+    assert!(
+        heard.len() > 1,
+        "The guidance follows the boundary in pieces"
+    );
+    assert!(heard
+        .iter()
+        .all(|entry| !entry.contains("<persisted-output>")));
+    assert!(heard.concat().contains("mcp__agent_studio__send_files"));
+    assert!(answer.contains("send_files"), "{answer}");
+}

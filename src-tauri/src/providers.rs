@@ -7,6 +7,7 @@ use std::{
 };
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
+pub mod after_compaction;
 pub mod artifact_tool;
 pub mod background;
 pub mod claude_settings;
@@ -919,7 +920,44 @@ impl RunRequest {
         };
         format!("This conversation began in {app}, outside Agent Studio, and now continues in Agent Studio; the messages above are its history. {} Format your response with Markdown where useful.", self.capabilities(provider == "claude"))
     }
+    /// What a Claude session hears again once Claude Code compacts it (`after_compaction`): the
+    /// guidance and instructions its first message gave, which the summary replaced, in parts
+    /// that each make sense alone. Empty for any other chat.
+    pub fn compaction_context(&self) -> Vec<String> {
+        if !self.uses_claude_visualizer() {
+            return Vec::new();
+        }
+        let [tools, visuals, files, questions, screens, workflows] = self.capability_sections(true);
+        let mut parts = vec![format!("You are having a conversation in Agent Studio. Its earlier messages were just compacted into a summary, so the guidance its first message gave follows again. {tools} Format your response with Markdown where useful.")];
+        parts.extend(
+            [visuals, files, questions, screens, workflows]
+                .into_iter()
+                .filter(|part| !part.is_empty()),
+        );
+        if !self.agent.instructions.trim().is_empty() {
+            parts.push(format!(
+                "Current user instructions for this conversation:\n{}",
+                self.agent.instructions
+            ));
+        }
+        let shared = self.shared_context.guidance();
+        if !shared.is_empty() {
+            parts.push(shared);
+        }
+        parts
+    }
     fn capabilities(&self, studio_tools: bool) -> String {
+        let [tools, visuals, files, questions, screens, workflows] =
+            self.capability_sections(studio_tools);
+        if studio_tools {
+            format!("{tools} {visuals} {files} {questions} {screens} {workflows}")
+        } else {
+            tools
+        }
+    }
+    /// The guidance a chat agent starts with, by subject: tools, visuals, files, questions,
+    /// screens and workflows, each empty when the chat has none of it.
+    fn capability_sections(&self, studio_tools: bool) -> [String; 6] {
         let tools = if self.tools_enabled() {
             // Every chat agent names its fences' languages, so the commands it gives can run in
             // a console. A Codex chat with Agent Studio's tools shows an artifact from a file, a
@@ -965,11 +1003,14 @@ impl RunRequest {
         } else {
             ""
         };
-        if studio_tools {
-            format!("{tools} {visuals} {files} {questions} {screens} {workflows}")
-        } else {
-            tools
-        }
+        [
+            tools,
+            visuals.into(),
+            files,
+            questions.into(),
+            screens.into(),
+            workflows.into(),
+        ]
     }
     pub fn native_context(&self) -> Option<String> {
         let native = self.base_native_context();
@@ -1967,6 +2008,42 @@ mod tests {
             "retained"
         );
     }
+    #[tokio::test]
+    async fn only_claude_chats_with_tools_hear_their_guidance_again_after_a_compaction() {
+        for provider in ["codex", "claude", "gemini"] {
+            let mut r = request();
+            r.agent.provider = provider.into();
+            r.agent.instructions = "Answer in French.".into();
+            let parts = r.compaction_context();
+            if provider != "claude" {
+                assert!(parts.is_empty(), "{provider}");
+                continue;
+            }
+            // What the first message said, by subject, then the current instructions.
+            assert!(parts[0].starts_with("You are having a conversation in Agent Studio."));
+            let all = parts.join("\n");
+            for guidance in [
+                crate::console::GUIDANCE,
+                visualize::GUIDANCE,
+                sent_files::GUIDANCE,
+                sent_files::COMPARE_GUIDANCE,
+                questions::GUIDANCE,
+            ] {
+                assert!(all.contains(guidance));
+            }
+            assert!(all.contains(&crate::artifacts::guidance(
+                crate::artifacts::Delivery::ClaudeAi
+            )));
+            assert!(parts.iter().all(|part| !part.trim().is_empty()));
+            assert_eq!(
+                parts.last().unwrap(),
+                "Current user instructions for this conversation:\nAnswer in French."
+            );
+            r.conversation_only = true;
+            assert!(r.compaction_context().is_empty());
+        }
+    }
+
     #[tokio::test]
     async fn background_requests_keep_tools_disabled() {
         let runtime = tempfile::tempdir().unwrap();
