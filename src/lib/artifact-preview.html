@@ -9,6 +9,11 @@ window.addEventListener('message', function receive(event) {
   const token = typeof event.data.sizeToken === 'string' && event.data.sizeToken.length <= 80 ? event.data.sizeToken : null;
   // A screen fills its frame and lays itself out; a visual takes the height of its content.
   const page = event.data.page === true;
+  // The expanded viewer hears where the reader scrolls the page, and hands that back when the
+  // page loads again, as when its chat is shown again: each scrolled element by its child indexes
+  // from the root element, the page itself with none.
+  const scrollToken = typeof event.data.scrollToken === 'string' && event.data.scrollToken.length <= 80 ? event.data.scrollToken : null;
+  const scrolled = scrollToken && Array.isArray(event.data.scroll) ? event.data.scroll.filter((place) => Array.isArray(place?.path) && place.path.every((index) => Number.isSafeInteger(index) && index >= 0) && Number.isFinite(place.x) && Number.isFinite(place.y)) : [];
   document.open();
   document.write(event.data.source);
   document.close();
@@ -34,6 +39,60 @@ window.addEventListener('message', function receive(event) {
     new MutationObserver(measure).observe(document.body, {childList:true,subtree:true,attributes:true,characterData:true});
     document.fonts.ready.then(measure);
     measure();
+  }
+  if (scrollToken) {
+    const root = () => document.scrollingElement || document.documentElement;
+    const pathOf = (target) => {
+      if (target === document || target === root()) return [];
+      const path = [];
+      for (let node = target; node !== document.documentElement; node = node.parentElement) {
+        if (!(node instanceof Element) || !node.parentElement) return null;
+        path.unshift(Array.prototype.indexOf.call(node.parentElement.children, node));
+      }
+      return path;
+    };
+    const at = (path) => {
+      let node = path.length ? document.documentElement : root();
+      for (const index of path) node = node && node.children[index];
+      return node || null;
+    };
+    const places = new Map(scrolled.map((place) => [place.path.join('/'), { path: place.path, x: place.x, y: place.y }]));
+    // The page goes back where the reader left it as its content arrives, until it is there once
+    // the page has loaded, the reader moves it, or the page settles elsewhere.
+    let restoring = places.size > 0, loadedAt = 0;
+    const started = Date.now();
+    addEventListener('load', () => (loadedAt = Date.now()), { once: true });
+    const stop = () => (restoring = false);
+    for (const type of ['wheel', 'touchstart', 'keydown', 'pointerdown']) addEventListener(type, stop, { capture: true, passive: true });
+    const restore = () => {
+      if (!restoring) return;
+      let there = true;
+      for (const { path, x, y } of places.values()) {
+        const element = at(path);
+        if (!element) {
+          there = false;
+          continue;
+        }
+        if (Math.abs(element.scrollLeft - x) < 1 && Math.abs(element.scrollTop - y) < 1) continue;
+        element.scrollLeft = x;
+        element.scrollTop = y;
+        if (Math.abs(element.scrollLeft - x) >= 1 || Math.abs(element.scrollTop - y) >= 1) there = false;
+      }
+      const now = Date.now();
+      if ((loadedAt && now - loadedAt > (there ? 250 : 1500)) || now - started > 10000) restoring = false;
+      else requestAnimationFrame(restore);
+    };
+    restore();
+    addEventListener('scroll', (event) => {
+      if (restoring) return;
+      const path = pathOf(event.target);
+      if (!path) return;
+      const element = path.length ? event.target : root();
+      const key = path.join('/');
+      if (element.scrollLeft || element.scrollTop) places.set(key, { path, x: element.scrollLeft, y: element.scrollTop });
+      else places.delete(key);
+      parent.postMessage({ type: 'studio-artifact-scroll', token: scrollToken, places: [...places.values()] }, '*');
+    }, { capture: true, passive: true });
   }
 });
 </script></body></html>

@@ -1,6 +1,7 @@
 <script lang="ts">
   import { Bot, Brain, ChevronDown, FileCode2, Layers, ListChecks, Workflow } from '@lucide/svelte';
   import { SvelteSet } from 'svelte/reactivity';
+  import { recall } from '$lib/chat-recall';
   import type { Message } from '$lib/domain';
   import { formatReplyTime, type ReplyTimeTotal } from '$lib/replies';
   import { changeBase, type ChangeSummary } from '$lib/file-changes';
@@ -28,6 +29,7 @@
     subagents = [],
     openSubagent,
     openedSubagent,
+    scope,
   }: {
     message: Message;
     timeTotal?: ReplyTimeTotal;
@@ -46,6 +48,8 @@
     openSubagent?: (agentId: string, messageId?: string) => void;
     /** The sub-agent whose conversation the side panel shows, and the reply that holds it. */
     openedSubagent?: { messageId: string; agentId: string };
+    /** Names the reply within its chat, which recalls the panel the reader left open. */
+    scope?: string;
   } = $props();
   // A running reply's row starts with its live elapsed time; a finished reply's with its
   // timing, files and, when it edited them, memories. Plans, workflows, sub-agents and
@@ -58,10 +62,16 @@
   const workflows = $derived(message.nativeWorkflows?.runs ?? []);
   // One panel opens below the row at a time. Each renders when first opened and then stays,
   // keeping file scope, list expansion and nested disclosures across panel switches.
-  let expanded = $state<string | null>(null);
-  const opened = new SvelteSet<string>();
+  const remembered = recall(() => scope);
+  const left = remembered.get<string>('expanded') ?? null;
+  let expanded = $state<string | null>(left);
+  const opened = new SvelteSet<string>(left ? [left] : []);
+  function show(section: string | null) {
+    expanded = section;
+    remembered.set('expanded', section ?? undefined);
+  }
   function toggle(section: string) {
-    expanded = expanded === section ? null : section;
+    show(expanded === section ? null : section);
     opened.add(section);
   }
   // Close a panel whose toggle is gone, such as background work that has finished.
@@ -73,7 +83,7 @@
       ...(subagents.length ? ['subagents'] : []),
       ...(background.length ? ['background'] : []),
     ];
-    if (expanded && !sections.includes(expanded)) expanded = null;
+    if (expanded && !sections.includes(expanded)) show(null);
   });
   const usage = $derived(message.usage);
   const elapsed = $derived(
@@ -342,7 +352,13 @@
     hidden={expanded !== 'files'}
   >
     {#if opened.has('files')}
-      <FileChanges response={responseChanges} chat={chatChanges} id={message.id} {base} />
+      <FileChanges
+        response={responseChanges}
+        chat={chatChanges}
+        id={message.id}
+        {base}
+        scope={scope && `${scope}/files`}
+      />
     {/if}
   </div>
   {#if memories}<div
@@ -358,6 +374,7 @@
           chat={chatMemory}
           id={message.id + '-memory'}
           {base}
+          scope={scope && `${scope}/memory`}
         />
       {/if}
     </div>{/if}

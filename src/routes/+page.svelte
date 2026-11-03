@@ -355,6 +355,8 @@
   import { carriedSubagents, findSubagent, replyTools } from '$lib/subagents';
   import ClaudePageViewer from '$lib/components/ClaudePageViewer.svelte';
   import { leaveChats, type ShownArtifact, type SubagentView } from '$lib/side-panels';
+  import { provideRecall, recalled, type ChatRecall } from '$lib/chat-recall';
+  import { findPlace, holdAnchor, readPlace, type Anchor, type ChatPlace } from '$lib/chat-places';
   import { codeBlockAction, consoleShells, performCodeBlockAction } from '$lib/code-blocks';
   import { artifactCardAction, recordArtifact, type Artifact } from '$lib/artifacts';
   import ImageAttachments from '$lib/components/ImageAttachments.svelte';
@@ -753,6 +755,15 @@
   // chat while another chat, Connections or Settings is shown (`src/lib/side-panels.ts`).
   let artifactViews = $state<Record<string, ShownArtifact>>({});
   let subagentViews = $state<Record<string, SubagentView>>({});
+  // What the window recalls of each chat it showed, by conversation (`src/lib/chat-recall.ts`):
+  // where the reader was reading, what they opened in it and where its side panels were scrolled.
+  const recalls = new Map<string, ChatRecall>();
+  function recallOf(chat: string) {
+    let recall = recalls.get(chat);
+    if (!recall) recalls.set(chat, (recall = new Map()));
+    return recall;
+  }
+  provideRecall(() => untrack(() => (activeId ? recallOf(activeId) : undefined)));
   // The chat on screen, whose panel shows.
   const panelChat = $derived(view === 'chat' ? activeId : null);
   const artifactView = $derived(panelChat ? artifactViews[panelChat] : undefined);
@@ -847,9 +858,11 @@
     if (artifactViews[activeId]?.mode === 'panel') delete artifactViews[activeId];
     subagentViews[activeId] = { messageId, agentId, focus: true };
   }
-  function closePanels(chat: string) {
+  // A deleted chat's panels close, and the window forgets what it recalled of it.
+  function forgetChat(chat: string) {
     delete artifactViews[chat];
     delete subagentViews[chat];
+    recalls.delete(chat);
   }
   // Conversations whose reply this window is stopping.
   let stopping = $state<Record<string, boolean>>({});
@@ -895,9 +908,15 @@
   let nearBottom = true;
   // The conversation's height when the chat last followed its end or the reader moved.
   let followedHeight = 0;
-  // The message a reader above the end was reading when Connections or Settings replaced the
-  // chat, and how far below the top of the conversation it was.
-  let readingPlace: { conversation: string; message: string; offset: number } | undefined;
+  // What the reader was reading when their chat came back above its end. Content that sizes
+  // itself later grows around it without moving it, until the reader moves; `place` waits for
+  // the rest of a place that was not all there yet. Meanwhile the browser's own scroll anchoring
+  // is off, since its adjustments arrive as scrolls the reader did not make.
+  let heldPlace: { anchor: Anchor; place?: ChatPlace } | undefined;
+  function holdPlace(held: typeof heldPlace) {
+    if (!held !== !heldPlace) chatScroll?.style.setProperty('overflow-anchor', held ? 'none' : '');
+    heldPlace = held;
+  }
   // Offers a way back to the end while the chat does not follow it and more than a few lines
   // lie below the view.
   let jumpShown = $state(false);
@@ -930,6 +949,7 @@
   }
   // Runs after the reader scrolls, expands, or collapses content.
   function readingPosition() {
+    holdPlace(undefined);
     if (glide) {
       // The glide's own scrolling keeps the chat following; any other scroll ends it here.
       if (!glide.frame || Math.abs((chatScroll?.scrollTop ?? 0) - glide.top) < 1) return;
@@ -1007,6 +1027,7 @@
     glide = undefined;
   }
   function takeOver() {
+    holdPlace(undefined);
     if (!glide) return;
     stopGlide();
     readingPosition();
@@ -1025,9 +1046,10 @@
     void activeId;
     untrack(() => virtualSpace?.clear());
     followedHeight = 0;
-    // Another chat opens at its end.
+    // Another chat opens where the reader left it.
     jumpShown = false;
     if (glide && glide.conversation !== activeId) stopGlide();
+    untrack(showPlace);
   });
   $effect(() => {
     const scroll = chatScroll;
@@ -1087,54 +1109,79 @@
         virtualSpace?.trim();
         stickToEnd(scroll);
         followedHeight = next;
-      }
+      } else if (heldPlace && !nearBottom) keepPlace();
       // Replies arriving below a reading position move the end away without a scroll.
       showJump();
     });
     observer.observe(column);
     return () => observer.disconnect();
   });
-  // Connections and Settings replace the chat, so remember the message being read above the
-  // end before it goes.
+  // Another chat, a new one, Connections, Settings, a screen or a workflow replaces the chat on
+  // screen, so the window recalls where its reader was before it goes (requested 2026-11-03):
+  // nowhere while they followed its end, else the place being read.
+  let placedChat: string | null = null;
   $effect.pre(() => {
-    if (view === 'chat') return;
+    const next = panelChat;
     untrack(() => {
-      const scroll = chatScroll;
-      if (!scroll?.isConnected || !chatColumn || !activeId || nearBottom) return;
-      const top = scroll.getBoundingClientRect().top;
-      for (const element of chatColumn.children) {
-        const box = element.getBoundingClientRect();
-        const message = (element as HTMLElement).dataset.messageId;
-        if (message && box.bottom > top) {
-          readingPlace = { conversation: activeId, message, offset: box.top - top };
-          return;
-        }
-      }
+      const left = placedChat;
+      placedChat = next;
+      if (!left || left === next) return;
+      holdPlace(undefined);
+      const scroll = chatScroll,
+        column = chatColumn;
+      if (!scroll?.isConnected || !column) return;
+      // A chat deleted while shown is forgotten.
+      if (!workspace.conversations.some((c) => c.id === left)) return;
+      const place = nearBottom ? undefined : readPlace(scroll, column);
+      recalled(recallOf(left), 'chat').set('place', place);
     });
   });
-  // The chat mounts again at its top: return to the end while following, and otherwise to the
-  // message the reader left.
-  $effect(() => {
+  // Shows the chat on screen as the reader left it in this window: at the place they were
+  // reading above its end, or else at its end, following it.
+  function showPlace() {
     const scroll = chatScroll,
       column = chatColumn;
     if (!scroll || !column) return;
-    untrack(() => {
-      const place = readingPlace;
-      readingPlace = undefined;
-      const message =
-        place?.conversation === activeId && !nearBottom
-          ? [...column.children].find(
-              (element) => (element as HTMLElement).dataset.messageId === place.message,
-            )
-          : undefined;
-      if (place && message)
-        scroll.scrollTop +=
-          message.getBoundingClientRect().top - scroll.getBoundingClientRect().top - place.offset;
-      else {
-        nearBottom = true;
-        void scrollToEnd();
-      }
-    });
+    holdPlace(undefined);
+    const place =
+      activeId && view === 'chat'
+        ? recalled(recalls.get(activeId), 'chat').get<ChatPlace>('place')
+        : undefined;
+    const found = place && findPlace(scroll, column, place);
+    if (!found) {
+      nearBottom = true;
+      void scrollToEnd();
+      return;
+    }
+    holdAnchor(scroll, found.anchor);
+    scrolledTo = { scroll, top: scroll.scrollTop };
+    readingPosition();
+    if (found.complete) {
+      if (!nearBottom) holdPlace({ anchor: found.anchor });
+      return;
+    }
+    // The rest of the place arrives later, so the chat waits for it, even at an end it reached
+    // without it.
+    nearBottom = false;
+    showJump();
+    holdPlace({ anchor: found.anchor, place });
+  }
+  // Without scroll anchoring, as in WebKit, content above the place that sizes itself after the
+  // chat came back would move the reader. What the place was in can arrive later too, as when
+  // the Viewer reads a chat it holds light whole again.
+  function keepPlace() {
+    const scroll = chatScroll,
+      column = chatColumn;
+    if (!scroll || !column || !heldPlace) return;
+    const found = heldPlace.place && findPlace(scroll, column, heldPlace.place);
+    if (found?.complete) holdPlace({ anchor: found.anchor });
+    if (!heldPlace.anchor.element.isConnected) holdPlace(undefined);
+    else if (holdAnchor(scroll, heldPlace.anchor)) scrolledTo = { scroll, top: scroll.scrollTop };
+  }
+  // The chat mounts again at its top, as after Connections or Settings.
+  $effect(() => {
+    if (!chatScroll || !chatColumn) return;
+    untrack(showPlace);
   });
   let saveQueue = Promise.resolve();
   const active = $derived(workspace.conversations.find((c) => c.id === activeId));
@@ -2574,7 +2621,7 @@
         () => {},
       );
       forgetDraft(draftKey.chat(conversation.id));
-      closePanels(conversation.id);
+      forgetChat(conversation.id);
     }
     workspace.conversations = workspace.conversations.filter((c) => !gone.has(c.id));
     if (activeId && gone.has(activeId)) newChat();
@@ -2892,7 +2939,7 @@
     // Unsent drafts stay with their own chat. Only an image still being read waits for it.
     if (activeId !== conversation.id && imagesLoading) return;
     notificationTarget = undefined;
-    if (activeId !== conversation.id) openConversation(conversation);
+    if (activeId !== conversation.id) openConversation(conversation, true);
     else {
       view = 'chat';
       sidebarOpen = false;
@@ -3216,6 +3263,7 @@
               steeringPending = {};
               artifactViews = {};
               subagentViews = {};
+              recalls.clear();
               sidebarOpen = false;
               folderBrowserOpen = false;
               contextOpen = false;
@@ -4917,7 +4965,7 @@
   // wherever it happens; History moves arriving by sync may be another computer's startup.
   function releaseDeleted(ids: Iterable<string>) {
     for (const id of ids) {
-      closePanels(id);
+      forgetChat(id);
       void releaseConversation(id).catch(() => {});
     }
   }
@@ -5136,9 +5184,10 @@
     query = '';
     openConversation(conversation);
   }
-  function openConversation(c: Conversation) {
-    // Another chat opens at its end, however far up the reader was in this one.
-    if (activeId !== c.id) nearBottom = true;
+  // Another chat opens as the reader left it in this window (`showPlace`), or at its end when
+  // `latest`, as from an alert about it.
+  function openConversation(c: Conversation, latest = false) {
+    if (latest) recalled(recalls.get(c.id), 'chat').set('place', undefined);
     delete finishedChats[c.id];
     templatesOpen = false;
     sidebarOpen = false;
@@ -5445,7 +5494,7 @@
       // Its unsent draft and its panels are deleted with the conversation.
       forgetDraft(draftKey.chat(target.id));
       rewoundDrafts.delete(target.id);
-      closePanels(target.id);
+      forgetChat(target.id);
       if (activeId === target.id) {
         composerDraftKey = '';
         newChat();

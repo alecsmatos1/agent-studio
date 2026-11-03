@@ -44,6 +44,7 @@
   import { renderMarkdown, type ArtifactCards } from '$lib/markdown';
   import { toolVisual } from '$lib/tool-presentation';
   import { openLink } from '$lib/transport';
+  import { recall } from '$lib/chat-recall';
   import { revealedDisclosures } from '$lib/disclosures';
   import DiffTable from './DiffTable.svelte';
   import ToolIcon from './ToolIcon.svelte';
@@ -67,6 +68,7 @@
     openSubagent,
     openedSubagent,
     writing,
+    scope,
   }: {
     tools: ToolActivity[];
     replyStatus: Message['status'];
@@ -97,6 +99,8 @@
     openedSubagent?: string;
     /** Question calls whose question Claude is still writing. */
     writing?: ReadonlySet<string>;
+    /** Names this work within its chat, which recalls what the reader opened in it. */
+    scope?: string;
   } = $props();
   let linkError = $state('');
   const labels = {
@@ -116,7 +120,12 @@
     owner ? undefined : replyStatus === 'running' ? 'writing' : 'cards',
   );
   const groups = $derived(groupActivityEntries(entries));
-  const disclosures = revealedDisclosures();
+  // As the reader left them when the chat was last shown (`src/lib/chat-recall.ts`): the live
+  // activity of a running reply and the Work history it becomes each recall their own.
+  const disclosures = revealedDisclosures(
+    recall(() => scope),
+    () => (replyStatus === 'running' ? 'live' : 'history'),
+  );
   // The sub-agents these calls hold, whose own calls show in their conversations.
   const agentIds = $derived.by(() => {
     const ids = new Set<string>();
@@ -148,7 +157,7 @@
   // A row the reader opened stays until they close it, even after its call would fold.
   const opened = new SvelteSet<string>();
   function liveToggle(id: string) {
-    const reveal = disclosures.opened(`tool:${id}`);
+    const reveal = disclosures.opened(`tool:${id}`, false);
     return (event: Event) => {
       reveal(event);
       if ((event.currentTarget as HTMLDetailsElement).open) opened.add(id);
@@ -290,6 +299,7 @@
   <details
     class="tool-card"
     data-category={tool.category}
+    open={disclosures.open(`tool:${tool.id}`)}
     ontoggle={disclosures.opened(`tool:${tool.id}`)}
   >
     <summary onclick={disclosures.reveal(`tool:${tool.id}`)}>
@@ -377,6 +387,7 @@
           {runId}
           {connectionId}
           {replyStatus}
+          scope={scope && `${scope}/tool:${tool.id}`}
         />{/if}
       {#if !tool.query && !tool.path && !showDetail && !tool.command && !tool.input && !tool.output && !edit && !tool.background && !facts(tool).length && !tool.sources.length && !tool.agents.length}
         <p class="tool-note">
@@ -446,7 +457,7 @@
   {@const active = calls.filter((tool) => tool.status === 'running' && !tool.background)}
   {@const elapsed = Math.max(-1, ...active.map((tool) => tool.elapsedMs ?? -1))}
   {@const progressTool = active.findLast((tool) => tool.progress)}
-  <details class="activity-group" ontoggle={disclosures.opened(key)}>
+  <details class="activity-group" open={disclosures.open(key)} ontoggle={disclosures.opened(key)}>
     <summary title="Expand for tool details" onclick={disclosures.reveal(key)}>
       {#if summary.running}<LoaderCircle size={16} class="spinning" aria-label="Running" />
       {:else}<ToolIcon icon={groupIcon(visible)} size={16} />{/if}
@@ -624,7 +635,11 @@
   >
     {#if replyStatus === 'running' || !history}{@render timeline()}
     {:else}
-      <details class="activity-summary" open={limited} ontoggle={disclosures.opened('history')}>
+      <details
+        class="activity-summary"
+        open={disclosures.open('history', limited)}
+        ontoggle={disclosures.opened('history')}
+      >
         <summary aria-label="Work history" onclick={disclosures.reveal('history')}>
           <ChevronDown size={14} class="disclosure" />
           <span class="history-title">Work history</span>

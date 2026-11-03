@@ -10,6 +10,7 @@
   import { Check, Copy, ImageOff, LoaderCircle, RotateCcw } from '@lucide/svelte';
   import type { ToolActivity } from '$lib/activity';
   import type { Message } from '$lib/domain';
+  import { recall } from '$lib/chat-recall';
   import { highlightCode } from '$lib/markdown';
   import { formatBytes, imageLabel, outputLines, type ToolOutputImageInfo } from '$lib/tool-output';
   import { FileViewer as Viewer, type ViewedImage } from '$lib/file-viewer.svelte';
@@ -22,12 +23,16 @@
     runId,
     connectionId,
     replyStatus,
+    scope,
   }: {
     tool: ToolActivity;
     runId?: string;
     connectionId?: string;
     replyStatus: Message['status'];
+    /** Names the call within its chat, which recalls how far the reader opened its result. */
+    scope?: string;
   } = $props();
+  const remembered = recall(() => scope);
 
   const shells = {
     bash: 'Bash',
@@ -49,7 +54,7 @@
   let error = $state('');
   let loading = $state(false);
   let attempt = $state(0);
-  let full = $state(false);
+  let full = $state(remembered.get<boolean>('full') ?? false);
   // Only the call and its run select a result; revisions and relay updates do not reload it.
   // A shortened command or input comes whole from the same result.
   const key = $derived(
@@ -142,7 +147,7 @@
   const kept = $derived((output?.stdout.bytes ?? 0) + (output?.stderr.bytes ?? 0));
   // A long result starts in a box of about 18 lines that scrolls.
   const tall = $derived(stdoutLines.length + outputLines(stderr).length > 18);
-  let expanded = $state(false);
+  let expanded = $state(remembered.get<boolean>('expanded') ?? false);
 
   let copied = $state('');
   let copyTimer: ReturnType<typeof setTimeout> | undefined;
@@ -250,8 +255,10 @@
                   type="button"
                   class="result-action"
                   aria-expanded={expanded}
-                  onclick={() => (expanded = !expanded)}
-                  >{expanded ? 'Show less' : 'Show all'}</button
+                  onclick={() => {
+                    expanded = !expanded;
+                    remembered.set('expanded', expanded || undefined);
+                  }}>{expanded ? 'Show less' : 'Show all'}</button
                 >{/if}
               {@render copyButton(
                 'Output',
@@ -311,7 +318,10 @@
                     type="button"
                     class="result-action"
                     disabled={loading}
-                    onclick={() => (full = true)}
+                    onclick={() => {
+                      full = true;
+                      remembered.set('full', true);
+                    }}
                     >{#if loading}<LoaderCircle
                         size={12}
                         class="spinning"

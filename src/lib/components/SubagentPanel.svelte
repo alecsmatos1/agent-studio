@@ -2,6 +2,7 @@
   import { onMount, untrack } from 'svelte';
   import { Bot, Check, CircleAlert, Layers, LoaderCircle, X } from '@lucide/svelte';
   import { activityDisplayStatus, type ActivityDisplayStatus } from '$lib/activity';
+  import { recalled, shownRecall } from '$lib/chat-recall';
   import type { Message } from '$lib/domain';
   import { renderMarkdown } from '$lib/markdown';
   import { panelRoom, showPanel } from '$lib/side-panels';
@@ -89,6 +90,7 @@
     const box = dialog;
     untrack(() => showPanel(box, dock, '[aria-label="Close sub-agent"]', !shown && !takeFocus));
     shown = true;
+    untrack(placeConversation);
   });
   // Closing returns focus to what had it when the panel opened; hidden with its chat, the panel
   // leaves focus where the reader moved it.
@@ -114,13 +116,24 @@
     };
   });
   // A running sub-agent opens at its latest update and follows new ones while the reader stays
-  // at the end; a finished one opens at its task.
+  // at the end; a finished one opens at its task. Shown again with its chat, its conversation
+  // opens where the reader left it (`src/lib/chat-recall.ts`).
+  const chat = shownRecall();
+  const remembered = $derived(recalled(chat, `subagent/${message.id}/${agentId}`));
   let following = false;
+  // A closed dialog has nothing to scroll, so each sub-agent's conversation is placed once the
+  // panel shows it.
+  let placed: string | undefined;
+  function placeConversation() {
+    if (!scroller || !dialog?.open || placed === agentId) return;
+    placed = agentId;
+    const left = remembered.get<{ top: number; following: boolean }>('scroll');
+    following = left ? left.following : live;
+    scroller.scrollTop = following ? scroller.scrollHeight : (left?.top ?? 0);
+  }
   $effect(() => {
     void agentId;
-    const running = untrack(() => live);
-    following = running;
-    if (scroller) scroller.scrollTop = running ? scroller.scrollHeight : 0;
+    untrack(placeConversation);
   });
   $effect(() => {
     if (!content || !scroller) return;
@@ -132,8 +145,9 @@
     return () => observer.disconnect();
   });
   function scrolled() {
-    if (scroller)
-      following = scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight < 8;
+    if (!scroller) return;
+    following = scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight < 8;
+    remembered.set('scroll', { top: scroller.scrollTop, following });
   }
   // Opening a call near the end reveals it below, where the reader keeps their place.
   function clicked(event: MouseEvent) {
@@ -200,23 +214,24 @@
   <!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_static_element_interactions (Only watches disclosure clicks, which have their own keyboard handling.) -->
   <div class="panel-scroll" bind:this={scroller} onscroll={scrolled} onclickcapture={clicked}>
     <div class="panel-content" bind:this={content}>
-      {#if agent}
-        {#if agent.task}<section class="task" aria-label="Task">
-            <span class="section-label">Task</span>
-            <p>{agent.task}</p>
-          </section>{/if}
-        <ToolActivity
-          tools={shownTools}
-          replyStatus={subagentReplyStatus(agent, replyStatus)}
-          {blocks}
-          runId={message.runId}
-          {connectionId}
-          {folder}
-          fileChanges={message.fileChanges}
-          history={false}
-          owner={agent.id}
-          openSubagent={open}
-        />
+      {#if agent}{#key agentId}
+          {#if agent.task}<section class="task" aria-label="Task">
+              <span class="section-label">Task</span>
+              <p>{agent.task}</p>
+            </section>{/if}
+          <ToolActivity
+            tools={shownTools}
+            replyStatus={subagentReplyStatus(agent, replyStatus)}
+            {blocks}
+            runId={message.runId}
+            {connectionId}
+            {folder}
+            fileChanges={message.fileChanges}
+            history={false}
+            owner={agent.id}
+            openSubagent={open}
+            scope={`subagent/${message.id}/${agentId}`}
+          />{/key}
         {#if live && !blocks.length}<p class="note" role="status">
             Waiting for the sub-agent’s first update…
           </p>{/if}

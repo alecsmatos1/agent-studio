@@ -249,3 +249,89 @@ test('the Viewer keeps chats light, shows the open chat whole and never erases r
     rmSync(directory, { recursive: true, force: true });
   }
 });
+
+test('the Viewer opens a chat again where the reader left it, once it has read it whole @webkit', async ({
+  page,
+}) => {
+  test.setTimeout(90_000);
+  const directory = mkdtempSync(join(tmpdir(), 'studio-light-places-'));
+  const token = 'synthetic-viewer-light-places-owner-key';
+  const server = createRelay({ token, directory, webDirectory: resolve('build') });
+  await new Promise<void>((done) => server.listen(0, '127.0.0.1', done));
+  const url = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
+  try {
+    const seeded = workspace();
+    // A reply with many calls and a long answer, read inside its Work history.
+    const reply = seeded.conversations[0].messages[1];
+    reply.blocks = [
+      ...Array.from({ length: 12 }, (_, i) => ({
+        type: 'activity' as const,
+        text: `Ran ${command} ${i}`,
+        tool: {
+          id: `call-${i}`,
+          revision: 1,
+          category: 'tool' as const,
+          name: 'Bash',
+          status: 'complete' as const,
+          command: `${command} ${i}`,
+          facts: [],
+          sources: [],
+          agents: [],
+        },
+      })),
+      {
+        type: 'markdown' as const,
+        text: Array.from({ length: 40 }, (_, i) => `Answer paragraph ${i + 1}.`).join('\n\n'),
+      },
+    ];
+    const seed = await fetch(`${url}/v1/state`, {
+      method: 'PUT',
+      headers: {
+        authorization: `Bearer ${token}`,
+        'x-environment-id': crypto.randomUUID(),
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({ revision: 0, workspace: seeded }),
+    });
+    expect(seed.status).toBe(200);
+    await page.goto(url);
+    await signInPwa(page, token);
+    await page.getByRole('tab', { name: /^Active/ }).click();
+    const open = (title: string) => page.getByRole('button', { name: title, exact: true }).click();
+    const below = () =>
+      page
+        .locator('.chat-scroll')
+        .evaluate((scroll) =>
+          Math.round(
+            scroll.querySelectorAll('.tool-card')[8].getBoundingClientRect().top -
+              scroll.getBoundingClientRect().top,
+          ),
+        );
+    await open('Fix the build');
+    await page.locator('summary[aria-label="Work history"]').click();
+    await page.locator('.activity-group > summary').first().click();
+    await expect(page.locator('.tool-card')).toHaveCount(12);
+    await page.locator('.chat-scroll').evaluate((scroll) => {
+      const call = scroll.querySelectorAll('.tool-card')[8];
+      scroll.scrollTop +=
+        call.getBoundingClientRect().top - scroll.getBoundingClientRect().top - 60;
+    });
+    await page.evaluate(
+      () => new Promise((done) => requestAnimationFrame(() => requestAnimationFrame(done))),
+    );
+    const call = await below();
+    expect(Math.abs(call - 60)).toBeLessThanOrEqual(1);
+
+    // Left, the chat goes light; shown again, it is read whole and opens as it was left.
+    await open('Still running elsewhere');
+    await expect(page.locator('summary[aria-label="Work history"]')).toHaveCount(0);
+    await open('Fix the build');
+    await expect(page.locator('.activity-summary')).toHaveAttribute('open', '');
+    await expect(page.locator('.activity-group').first()).toHaveAttribute('open', '');
+    await expect.poll(async () => Math.abs((await below()) - call)).toBeLessThanOrEqual(1);
+  } finally {
+    server.closeAllConnections();
+    await new Promise<void>((done) => server.close(() => done()));
+    rmSync(directory, { recursive: true, force: true });
+  }
+});

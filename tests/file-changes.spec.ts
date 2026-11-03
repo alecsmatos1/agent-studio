@@ -425,7 +425,10 @@ test('edits of the agent memory open in their own card beside Files edited', asy
     'aria-selected',
     'true',
   );
+  // A file opened in a scope stays open there.
   await card.getByRole('tab', { name: 'This response', exact: true }).click();
+  await expect(index.locator('.diff-code')).toHaveText('+- [Tests](feedback_tests.md)');
+  await index.locator('summary').click();
   await card.getByTitle(memory + 'feedback_tests.md', { exact: true }).click();
   await expect(card.locator('.changed-file[open] .diff-code')).toHaveText(
     '+Run the tests in the foreground.',

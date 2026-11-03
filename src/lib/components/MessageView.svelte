@@ -18,6 +18,7 @@
   } from '@lucide/svelte';
   import { messageText, providers, type Message, type ChatSettings } from '$lib/domain';
   import { awaitingAnswer } from '$lib/questions';
+  import { recall } from '$lib/chat-recall';
   import { draftRequest, shownQuestionDrafts, type QuestionDraft } from '$lib/question-drafts';
   import { replyContent, highlightCode } from '$lib/markdown';
   import { openLink } from '$lib/transport';
@@ -135,6 +136,8 @@
       : message.blocks,
   );
   let linkError = $state('');
+  // What the reader opened in the message, as its chat recalls it (`src/lib/chat-recall.ts`).
+  const remembered = recall(() => message.id);
   const author = $derived(message.settings ?? agent);
   // The model that ran, as the picker shows it: its version on its family's tint.
   const mark = $derived(modelMark(author.provider, replyModelName(message)));
@@ -444,6 +447,7 @@
     {subagents}
     {openSubagent}
     {openedSubagent}
+    scope={message.id}
   />
   {#if message.status !== 'running' && (fork || (canRetry && !message.workflowDefinition) || linkError || undoEdits || message.filesUndone)}<div
       class="message-actions"
@@ -502,7 +506,11 @@
       <div class="message-heading">
         <strong>Workflow</strong>{#if sent}<span>{sent}</span>{/if}
       </div>
-      <details class="workflow-update">
+      <details
+        class="workflow-update"
+        open={remembered.get<boolean>('update')}
+        ontoggle={(event) => remembered.set('update', event.currentTarget.open || undefined)}
+      >
         <summary title={update}>{update || 'Update'}</summary>
         <div class="user-text">{text}</div>
       </details>
@@ -561,6 +569,7 @@
             {openSubagent}
             openedSubagent={opened}
             {writing}
+            scope={`${message.id}/${part.steer?.id ?? ''}`}
           />
           {#if last}{@render outcome()}{/if}
         </div>

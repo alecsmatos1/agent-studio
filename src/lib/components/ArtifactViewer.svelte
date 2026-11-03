@@ -5,7 +5,9 @@
   import { artifactFilename } from '$lib/artifacts';
   import { visualizationPreview } from '$lib/visualization-preview';
   import { appearance } from '$lib/appearance.svelte';
+  import { recall } from '$lib/chat-recall';
   import { highlightCode } from '$lib/markdown';
+  import { pageScrollReport, type PageScroll } from '$lib/page-scroll';
   import { panelRoom, showPanel } from '$lib/side-panels';
   import { artifactPreviewUrl, downloadArtifact } from '$lib/transport';
   import PanelResize from './PanelResize.svelte';
@@ -27,7 +29,11 @@
   let workspaceWidth = $state(0);
   let panelWidth = $state<number>();
   const docked = $derived(mode === 'panel' && viewportWidth >= 1100 && workspaceWidth >= 780);
-  let tab = $state<'preview' | 'source'>('preview');
+  // How the reader left the artifact in its chat: its tab, and where its page and its source
+  // were scrolled (`src/lib/chat-recall.ts`). Closing it forgets them.
+  const remembered = recall(() => `artifact/${artifact.id}`);
+  let tab = $state<'preview' | 'source'>(remembered.get('tab') ?? 'preview');
+  $effect(() => remembered.set('tab', tab === 'source' ? tab : undefined));
   const highlightedSource = $derived(
     tab === 'source' ? highlightCode(artifact.source, artifact.language) : null,
   );
@@ -57,12 +63,14 @@
     // Keep the same sandboxed iframe when changing presentation.
     untrack(() => showPanel(box, dock, '[aria-label="Close artifact"]', !shown && !takeFocus));
     shown = true;
+    untrack(placeSource);
   });
   // Closing returns focus to what had it when the viewer opened; hidden with its chat, the
   // viewer leaves focus where the reader moved it.
   let dismissed = false;
   function dismiss() {
     dismissed = true;
+    remembered.clear();
     close();
   }
   onMount(() => {
@@ -85,24 +93,54 @@
       if (dismissed && focused?.isConnected) focused.focus();
     };
   });
+  // Where the preview last said the reader scrolled the page, which it opens at each time it
+  // loads: shown again with its chat, after Restart preview and in a newer revision.
+  let pageScroll = remembered.get<PageScroll[]>('page') ?? [];
+  let frame: HTMLIFrameElement | undefined;
+  let scrollToken = '';
   function initialize(event: Event) {
-    // Send once to the constant renderer; this expanded viewer accepts no child messages.
-    const frame = event.currentTarget as HTMLIFrameElement;
-    if (frame.dataset.initialized) return;
-    frame.dataset.initialized = 'true';
-    frame.contentWindow?.postMessage(
+    // Send once to the constant renderer; this expanded viewer hears from it only where the
+    // reader scrolls the page, under the token of this loading.
+    const target = event.currentTarget as HTMLIFrameElement;
+    if (target.dataset.initialized) return;
+    target.dataset.initialized = 'true';
+    frame = target;
+    scrollToken = crypto.randomUUID();
+    const scroll = { scrollToken, scroll: pageScroll };
+    target.contentWindow?.postMessage(
       artifact.visualization
-        ? visualizationPreview(artifact.source, undefined, appearance.resolved)
-        : {
-            type: 'studio-artifact',
-            source: artifact.source,
-          },
+        ? { ...visualizationPreview(artifact.source, undefined, appearance.resolved), ...scroll }
+        : { type: 'studio-artifact', source: artifact.source, ...scroll },
       '*',
     );
   }
+  function heard(event: MessageEvent) {
+    if (!frame || event.source !== frame.contentWindow) return;
+    const places = pageScrollReport(event.data, scrollToken);
+    if (!places) return;
+    pageScroll = places;
+    remembered.set('page', places.length ? places : undefined);
+  }
+  // The source scrolls in the content area, and opens where the reader left it.
+  let content = $state<HTMLDivElement>();
+  function contentScrolled() {
+    if (tab === 'source' && content)
+      remembered.set('source', { x: content.scrollLeft, y: content.scrollTop });
+  }
+  // A closed dialog has nothing to scroll: the source is placed once the viewer shows it.
+  function placeSource() {
+    const left = remembered.get<{ x: number; y: number }>('source');
+    if (tab !== 'source' || !content || !dialog?.open || !left) return;
+    content.scrollLeft = left.x;
+    content.scrollTop = left.y;
+  }
+  $effect(() => {
+    void [tab, highlightedSource];
+    untrack(placeSource);
+  });
 </script>
 
-<svelte:window bind:innerWidth={viewportWidth} />
+<svelte:window bind:innerWidth={viewportWidth} onmessage={heard} />
 <!-- Docked, the gap between the chat and the panel resizes it. -->
 {#if docked}<PanelResize
     gutter={12}
@@ -191,6 +229,8 @@
   <div
     class="artifact-content"
     class:visualization-preview={artifact.visualization && tab === 'preview'}
+    bind:this={content}
+    onscroll={contentScrolled}
     role="tabpanel"
     aria-label={tab === 'preview' ? 'Artifact preview' : 'Artifact source'}
   >

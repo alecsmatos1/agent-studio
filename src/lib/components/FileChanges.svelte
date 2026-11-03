@@ -2,6 +2,7 @@
   import { ChevronRight } from '@lucide/svelte';
   import { changedFilePath, type ChangeSummary } from '$lib/file-changes';
   import { fileTypeIcon } from '$lib/tool-presentation';
+  import { recall } from '$lib/chat-recall';
   import { revealedDisclosures } from '$lib/disclosures';
   import DiffTable from './DiffTable.svelte';
   import ToolIcon from './ToolIcon.svelte';
@@ -11,6 +12,7 @@
     id,
     base,
     memory = false,
+    scope,
   }: {
     response: ChangeSummary;
     chat: ChangeSummary;
@@ -19,10 +21,22 @@
     base?: string;
     /** Edits of the agent's memory. */
     memory?: boolean;
+    /** Names the card within its chat, which recalls its scope, list and diffs as left. */
+    scope?: string;
   } = $props();
-  let mode = $state<'response' | 'chat'>('response');
+  const remembered = recall(() => scope);
+  let mode = $state<'response' | 'chat'>(remembered.get('mode') ?? 'response');
   const initialFileLimit = 5;
-  let expandedFiles = $state({ response: false, chat: false });
+  let expandedFiles = $state(
+    remembered.get<{ response: boolean; chat: boolean }>('files') ?? {
+      response: false,
+      chat: false,
+    },
+  );
+  $effect(() => {
+    remembered.set('mode', mode);
+    remembered.set('files', { ...expandedFiles });
+  });
   const selected = $derived(mode === 'response' ? response : chat);
   const showAll = $derived(expandedFiles[mode]);
   const visibleFiles = $derived(
@@ -33,7 +47,7 @@
   const removed = $derived(existingFiles.reduce((n, f) => n + (f.removed ?? 0), 0));
   const kindLabels = { added: 'Added', modified: 'Edited', deleted: 'Deleted', renamed: 'Renamed' };
   // Diffs render when their file is first expanded.
-  const diffs = revealedDisclosures();
+  const diffs = revealedDisclosures(remembered);
   const fileKey = (file: ChangeSummary['files'][number]) =>
     `${mode}:${file.previousPath ?? ''}:${file.path}`;
   function displayPath(path: string) {
@@ -105,7 +119,7 @@
           </p>{/if}
         {#each visibleFiles as file (fileKey(file))}
           {@const key = fileKey(file)}
-          <details class="changed-file" ontoggle={diffs.opened(key)}>
+          <details class="changed-file" open={diffs.open(key)} ontoggle={diffs.opened(key)}>
             <summary title={file.path} onclick={diffs.reveal(key)}>
               <ChevronRight size={13} class="disclosure" />
               <ToolIcon icon={fileTypeIcon(file.path)} size={14} />
