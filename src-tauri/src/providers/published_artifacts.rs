@@ -4,11 +4,14 @@
 //! with its own claude.ai login, so Agent Studio reads no credential. The reply keeps a card for
 //! each artifact its parent calls published or opened, from the call's structured result: the
 //! artifact's id, link and title, never the page. A new artifact and an open call also ask the
-//! window that runs the reply to open the link, as the CLI's terminal opens the browser.
+//! window that runs the reply to open the link, as the CLI's terminal opens the browser. A Claude
+//! chat publishes its pages by default and works on top of them (`artifacts::guidance`). Each
+//! reply counts its own revisions from one, so a later reply's card can read revision 1 of an
+//! artifact already at 3 (`newestPage` in `src/lib/side-panels.ts`).
 use crate::protocol::RunEvent;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// What a Claude chat's launch adds to its environment: the Artifact tools, which a headless
 /// session leaves out unless asked (`sdk_default_off` in Claude Code 2.1.306), without the
@@ -42,12 +45,32 @@ pub fn valid_url(url: &str) -> bool {
         .is_some_and(|id| uuid::Uuid::parse_str(id).is_ok() && id.len() == 36)
 }
 
+/// The id an artifact's link carries: the UUID itself under `/code`, or written in base 58 in a
+/// short link. Claude Code reports no `artifact_id` for a page it made from an Artifact type
+/// (2.1.308 and 2.1.317), only the link.
+fn link_id(url: &str) -> Option<String> {
+    if let Some(short) = url.strip_prefix("https://claude.ai/artifact/") {
+        const DIGITS: &[u8] = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+        let mut value = 0u128;
+        for byte in short.bytes() {
+            let digit = DIGITS.iter().position(|digit| *digit == byte)?;
+            value = value.checked_mul(58)?.checked_add(digit as u128)?;
+        }
+        return Some(uuid::Uuid::from_u128(value).to_string());
+    }
+    url.strip_prefix("https://claude.ai/code/artifact/")
+        .map(str::to_ascii_lowercase)
+}
+
 /// The cards of one reply, from its parent's Artifact calls.
 #[derive(Default)]
 pub struct PublishedArtifacts {
     /// Each parent call by id, with the action it asked for.
     calls: HashMap<String, String>,
     cards: Vec<PublishedArtifact>,
+    /// Pages made from an Artifact type that open on their first write, so the reader does not
+    /// first see them empty.
+    opens_on_write: HashSet<String>,
 }
 impl PublishedArtifacts {
     /// Whether this reply published or opened an artifact, so a card alone is a complete answer.
@@ -97,17 +120,27 @@ impl PublishedArtifacts {
             .collect()
     }
     fn card(&mut self, action: &str, result: &Value) -> Option<RunEvent> {
-        // A new artifact opens, as the CLI's own first publish does; so does an open call.
+        let url = result["url"].as_str().filter(|url| valid_url(url))?;
+        let id = match result.get("artifact_id") {
+            Some(id) => id
+                .as_str()
+                .filter(|id| uuid::Uuid::parse_str(id).is_ok() && id.len() == 36)?
+                .to_ascii_lowercase(),
+            None => link_id(url)?,
+        };
+        // A new artifact opens, as the CLI's own first publish does; so does an open call. One made
+        // from a type may ask to open on its first write instead, and one that already existed
+        // is not new.
         let open = match action {
-            "publish" => result["updated"] != true,
+            "publish" if result["auto_open"] == "after_first_write" => {
+                self.opens_on_write.insert(id.clone());
+                false
+            }
+            "publish" if result["already_created"] == true => false,
+            "publish" => result["updated"] != true || self.opens_on_write.remove(&id),
             "open" if result["opened"] == true => true,
             _ => return None,
         };
-        let id = result["artifact_id"]
-            .as_str()
-            .filter(|id| uuid::Uuid::parse_str(id).is_ok() && id.len() == 36)?
-            .to_ascii_lowercase();
-        let url = result["url"].as_str().filter(|url| valid_url(url))?;
         // One line, as the card shows it.
         let title: String = result["title"]
             .as_str()
@@ -217,6 +250,81 @@ mod tests {
             event,
             json!({"kind":"publishedartifact","publishedArtifact":{"id":ID,"revision":3,"url":URL,"title":"Agent Studio publish test"}})
         );
+    }
+
+    #[test]
+    fn a_page_made_from_a_type_is_known_by_its_link() {
+        // The answer Claude Code 2.1.317 gave for a real publish from a type on 2026-11-03, whose
+        // only name for the artifact is its link.
+        let made = |extra: Value| {
+            let mut answer = json!({"created_from_type":true,"url":URL,"version":"1793738723-8370","owned":true,"title":"Billing report","type":{"url":"https://claude.ai/artifact/Rp9naXUCj2xozpUkyQy19W","release":"1793735263-07c8"},"own_files":[],"type_files":["index.html"],"provisioned":true,"liveSubscription":"none","instructions":"Fill it in","instructions_chars":10});
+            answer
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            answer
+        };
+        let input = json!({"type_url":"https://claude.ai/artifact/Rp9naXUCj2xozpUkyQy19W","title":"Billing report"});
+        let mut seen = PublishedArtifacts::default();
+        seen.observe_claude(&call("t1", input.clone(), Value::Null));
+        let shown = cards(seen.observe_claude(&result(
+            "t1",
+            made(json!({"auto_open":"at_create"})),
+            false,
+        )));
+        // The link decodes to the id a file's publish reports for it, so both are one card.
+        assert_eq!(shown[0].0.id, ID);
+        assert!(shown[0].1);
+        seen.observe_claude(&call("t2", json!({"file_path":"x"}), Value::Null));
+        let filled = cards(seen.observe_claude(&result("t2", published(true), false)));
+        assert_eq!((filled[0].0.revision, filled[0].1), (2, false));
+        assert_eq!(seen.cards.len(), 1);
+
+        // Asked to wait, it opens on its first write, once.
+        let mut seen = PublishedArtifacts::default();
+        seen.observe_claude(&call("t1", input.clone(), Value::Null));
+        let shown = cards(seen.observe_claude(&result(
+            "t1",
+            made(json!({"auto_open":"after_first_write"})),
+            false,
+        )));
+        assert!(!shown[0].1);
+        for (id, opens) in [("t2", true), ("t3", false)] {
+            seen.observe_claude(&call(id, json!({"file_path":"x"}), Value::Null));
+            let filled = cards(seen.observe_claude(&result(id, published(true), false)));
+            assert_eq!(filled[0].1, opens);
+        }
+
+        // A call repeated after it already made the page opens nothing.
+        let mut seen = PublishedArtifacts::default();
+        seen.observe_claude(&call("t1", input, Value::Null));
+        let again =
+            cards(seen.observe_claude(&result("t1", made(json!({"already_created":true})), false)));
+        assert!(!again[0].1);
+    }
+
+    #[test]
+    fn a_link_carries_the_artifacts_id() {
+        assert_eq!(link_id(URL).as_deref(), Some(ID));
+        // Base 58 pads a small value with its zero digit, to the 22 digits a link always has.
+        assert_eq!(
+            link_id("https://claude.ai/artifact/1111111111111111111112").as_deref(),
+            Some("00000000-0000-0000-0000-000000000001")
+        );
+        assert_eq!(
+            link_id(&format!(
+                "https://claude.ai/code/artifact/{}",
+                ID.to_uppercase()
+            ))
+            .as_deref(),
+            Some(ID)
+        );
+        // Past 128 bits, it names nothing.
+        assert_eq!(
+            link_id("https://claude.ai/artifact/zzzzzzzzzzzzzzzzzzzzzz"),
+            None
+        );
+        assert_eq!(link_id("https://example.com/artifact/x"), None);
     }
 
     #[test]
