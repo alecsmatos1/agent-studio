@@ -188,10 +188,8 @@ async fn installed_claude_reply_waits_for_declared_tests_but_not_servers() {
 #[tokio::test]
 #[ignore = "Opt-in installed Claude CLI test; uses subscription capacity and a model's tool choice."]
 async fn installed_claude_corrects_a_command_its_safety_check_refuses() {
-    // The folder's long name: Claude Code also asks for a write under a Windows short name.
-    let temp = std::fs::canonicalize(std::env::temp_dir()).unwrap();
-    let root = tempfile::tempdir_in(temp.to_string_lossy().trim_start_matches(r"\\?\")).unwrap();
-    let (result, events, parkable) = run_in(root.path(), "Make a shots folder here with empty files a.png and b.png, clear the images out of it again and write done into shots/result.txt, then say what the folder holds. Start with this command in the Bash tool, and change it only if you have to:\n\nSRCD=$PWD/shots; mkdir -p $SRCD; touch $SRCD/a.png $SRCD/b.png; rm -f $SRCD/*.png; echo done > $SRCD/result.txt; ls $SRCD", false, false).await;
+    let root = tempfile::tempdir().unwrap();
+    let (result, events, parkable) = run_in(root.path(),"Make a shots folder here with empty files a.png and b.png, clear the images out of it again and write done into shots/result.txt, then say what the folder holds. Start with this command in the Bash tool, and change it only if you have to:\n\nSRCD=$PWD/shots; mkdir -p $SRCD; touch $SRCD/a.png $SRCD/b.png; rm -f $SRCD/*.png; echo done > $SRCD/result.txt; ls $SRCD", false, false).await;
     let (status, text) = result.expect("Installed CLI failed");
     eprintln!("{:#?}\n{text}", outline(&events));
     assert_eq!(status, "complete");

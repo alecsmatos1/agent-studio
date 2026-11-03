@@ -29,24 +29,33 @@ pub(super) fn response(value: &Value, answer: Option<&Answer>, error: Option<&st
     json!({"type":"control_response","response":{"subtype":"success","request_id":value["request_id"],"response":result}})
 }
 /// Answers a permission request for a tool that no plan decision or question took. Claude Code
-/// asks while planning, but also with permissions bypassed: its safety checks want a person for
-/// `rm` on a variable path or a write under a Windows short name, as ask rules and hooks can. Nobody
-/// answers those prompts in a chat, so the agent gets Claude Code's own reason, which often says
-/// how to write the call. Telling it the session was planning made it stop and ask the user to
-/// turn off a plan mode that was never on.
+/// asks while planning, but also with permissions bypassed: its critical-path check wants a person
+/// for `rm` on `$D/*.png`, `rm -rf *` or a top-level folder, and ask rules and hooks can ask too.
+/// Nobody answers those prompts in a chat, so this stays aligned with Claude's desktop app, which
+/// denies such a removal itself, and tells the agent what Claude Code tells it there (2.1.317).
+/// The desktop path is not one a host can choose: the CLI keeps it for its first-party entrypoints.
+/// Telling the agent the session was planning made it stop and ask the user to turn off a plan mode
+/// that was never on.
 pub fn refuse_tool(value: &Value, planning: bool) -> Value {
-    let reason = value["request"]["decision_reason"]
+    let request = &value["request"];
+    let reason = request["decision_reason"]
         .as_str()
         .map(str::trim)
         .filter(|reason| !reason.is_empty());
-    let message = match (planning, reason) {
-        (true, _) => "This action requires permission that is unavailable in the current mode. While planning, propose the change and request ExitPlanMode approval before implementation.".to_string(),
-        (false, Some(reason)) => format!("{ASKS_A_PERSON} Claude Code's reason: {reason}\nCorrect the call if that reason shows how. Otherwise leave it undone, without another route to the same effect, finish the rest of the work and tell the user what it needed."),
-        (false, None) => format!("{ASKS_A_PERSON}\nLeave the call undone, without another route to the same effect, finish the rest of the work and tell the user what it needed."),
+    let message = if planning {
+        "This action requires permission that is unavailable in the current mode. While planning, propose the change and request ExitPlanMode approval before implementation.".to_string()
+    } else if let Some(removal) = reason.filter(|reason| reason.starts_with("Dangerous rm")) {
+        format!("{REMOVAL_REFUSED}{removal}")
+    } else {
+        let needed = reason
+            .or(request["tool_name"].as_str())
+            .unwrap_or("this tool use");
+        format!("{NO_APPROVAL}{needed}")
     };
     json!({"type":"control_response","response":{"subtype":"success","request_id":value["request_id"],"response":{"behavior":"deny","message":message}}})
 }
-const ASKS_A_PERSON: &str = "Claude Code asks for a person's approval before this call, and Agent Studio does not give that approval, so the call did not run. The session's permission mode has not changed.";
+const REMOVAL_REFUSED: &str = "Permission for this command was denied by a built-in Claude Code safety check, not by the user. The check stops removals that can delete far more than intended: a system, home or workspace directory, or a target it cannot resolve, such as a shell variable that, if unset or empty, turns this into `rm -rf /` or `rm -rf /*`. Only a person may approve such a removal, and no person did (no permission prompt was shown). The command was NOT run; do not claim it succeeded. Do not work around the check by splitting, scripting, or re-issuing the removal through another tool or shell: the check exists because a removal like this can destroy the user's data, and getting past it would not make it safe. If the text below suggests a safe rewrite, run that instead; it goes through the same check. Otherwise finish the rest of the task without this removal, tell the user what you wanted to delete and why, and leave the removal to them. What was flagged: ";
+const NO_APPROVAL: &str = "Permission for this tool use was denied. It requires approval, and this session has no approval surface: nobody can answer a permission prompt here, so it was denied automatically. The action was NOT performed; do not claim it succeeded, and do not retry it: this action, and anything else that requires approval, will be denied the same way for the rest of this session. Tell the user what was blocked and why you needed it, then continue with the parts of the task that do not require approval. What required approval: ";
 impl Session {
     pub(super) fn observe_plan(&mut self, value: &Value) {
         if value["type"] != "assistant" || !value["parent_tool_use_id"].is_null() {
@@ -190,23 +199,45 @@ mod tests {
             .to_owned()
     }
     #[test]
-    fn a_refused_tool_hears_claude_codes_reason_and_of_planning_only_while_planning() {
-        // As Claude Code 2.1.317 asks under bypassed permissions.
+    fn a_refused_tool_hears_what_claude_code_says_and_of_planning_only_while_planning() {
+        // As Claude Code 2.1.317 asks under bypassed permissions: a removal reads as it does in
+        // Claude's desktop app, with the reason that says how to rewrite it.
         let reason = "Dangerous rm operation on possibly-empty variable path: $D/*.png in `rm -f $D/*.png` (rewrite it as \"${D:?}\"/*.png or use a literal path)";
         let check = json!({"subtype":"can_use_tool","tool_name":"Bash","input":{"command":"rm -f $D/*.png"},"decision_reason":reason,"decision_reason_type":"safetyCheck","tool_use_id":"tool"});
-        let build = refusal(check.clone(), false);
-        assert!(build.contains(reason), "{build}");
-        assert!(build.contains("has not changed"));
-        assert!(!build.contains("planning"), "{build}");
-        assert!(!build.contains("ExitPlanMode"), "{build}");
-        // A request without a reason, as a rule's or an older CLI's, or with an empty one.
-        for request in [
-            json!({"subtype":"can_use_tool","tool_name":"Bash","decision_reason_type":"rule"}),
-            json!({"subtype":"can_use_tool","tool_name":"Bash","decision_reason":"  "}),
+        for build in [
+            refusal(check.clone(), false),
+            refusal(
+                json!({"subtype":"can_use_tool","tool_name":"Bash","decision_reason":"Dangerous rmdir operation on critical path: /x"}),
+                false,
+            ),
+        ] {
+            assert!(build.contains("not by the user"), "{build}");
+            assert!(build.contains("was NOT run"), "{build}");
+            assert!(build.contains("Do not work around the check"), "{build}");
+            assert!(build.contains("What was flagged: Dangerous rm"), "{build}");
+            assert!(!build.contains("planning"), "{build}");
+            assert!(!build.contains("ExitPlanMode"), "{build}");
+        }
+        assert!(refusal(check.clone(), false).ends_with(reason));
+        // Anything else that asks reads as a session with no approval surface: a reason it gives,
+        // or the tool when it gives none or an empty one, as a rule's does.
+        for (request, needed) in [
+            (
+                json!({"subtype":"can_use_tool","tool_name":"Write","decision_reason":"Another check","decision_reason_type":"safetyCheck"}),
+                "What required approval: Another check",
+            ),
+            (
+                json!({"subtype":"can_use_tool","tool_name":"Bash","decision_reason_type":"rule"}),
+                "What required approval: Bash",
+            ),
+            (
+                json!({"subtype":"can_use_tool","tool_name":"Bash","decision_reason":"  "}),
+                "What required approval: Bash",
+            ),
         ] {
             let build = refusal(request, false);
-            assert!(!build.contains("reason"), "{build}");
-            assert!(build.contains("did not run"));
+            assert!(build.ends_with(needed), "{build}");
+            assert!(build.contains("no approval surface"), "{build}");
             assert!(!build.contains("planning"), "{build}");
         }
         // Planning, the mode is the reason, whatever else the CLI reports.
