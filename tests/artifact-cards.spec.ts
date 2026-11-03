@@ -368,6 +368,57 @@ test('a claude.ai artifact opens beside the chat in the claude.ai session of its
   ).toBeVisible();
 });
 
+test('a later reply that changes a claude.ai artifact loads it again beside the chat', async ({
+  page,
+}) => {
+  await mockDesktop(page, 'capabilities');
+  await recordPages(page);
+  await page.goto('/');
+  await chooseTestFolder(page);
+  await ask(page, 'Make the quarterly page');
+  await emit(page, published(1, true));
+  // The first reply publishes it twice, so what shows is at revision 2.
+  const viewer = page.locator('#claude-page-viewer');
+  await expect(viewer.getByRole('heading', { name: 'Quarterly report' })).toBeVisible();
+  await expect.poll(async () => (await lastPageRequest(page))?.bounds ?? null).not.toBeNull();
+  const first = (await lastPageRequest(page)).load;
+  await emit(page, published(2, false));
+  await expect.poll(async () => (await lastPageRequest(page)).load).not.toBe(first);
+  await emit(page, { kind: 'text', text: 'Published it.' });
+  await finish(page, 'complete');
+  await expect(page.getByLabel('Message', { exact: true })).toBeEnabled();
+  const before = (await lastPageRequest(page)).load;
+  // A reply counts its own revisions from one: this update reads below what shows.
+  await ask(page, 'Rename it');
+  await emit(page, {
+    kind: 'publishedartifact',
+    publishedArtifact: { ...published(1, false).publishedArtifact, title: 'Annual report' },
+  });
+  await expect.poll(async () => (await lastPageRequest(page)).load).not.toBe(before);
+  await expect(viewer.getByRole('heading', { name: 'Annual report' })).toBeVisible();
+  await emit(page, { kind: 'text', text: 'Renamed it.' });
+  await finish(page, 'complete');
+  // Each reply keeps its card, and the panel stays open on the artifact without loading it again.
+  await expect(page.locator('.published-card')).toHaveCount(2);
+  const settled = (await lastPageRequest(page)).load;
+  await page.evaluate(() => window.dispatchEvent(new Event('pointerdown')));
+  expect((await lastPageRequest(page)).load).toBe(settled);
+  // Closed and opened from the earlier reply's card, it shows the latest, loading once.
+  await viewer.getByRole('button', { name: 'Close artifact', exact: true }).click();
+  await expect(viewer).toHaveCount(0);
+  const requests = () => page.evaluate(() => (window as any).pageRequests.length as number);
+  const loads = () =>
+    page.evaluate(() =>
+      new Set((window as any).pageRequests.map((request: { load: string }) => request.load)).size,
+    );
+  const known = await loads();
+  await page.locator('.published-card').first().getByRole('button').first().click();
+  await expect(viewer.getByRole('heading', { name: 'Annual report' })).toBeVisible();
+  await expect.poll(requests).toBeGreaterThan(0);
+  await expect.poll(async () => (await lastPageRequest(page)).bounds ?? null).not.toBeNull();
+  expect(await loads()).toBe(known + 1);
+});
+
 test('a claude.ai artifact opens in the browser where the window shows none', async ({ page }) => {
   await mockDesktop(page, 'capabilities');
   await recordPages(page, 'linux');

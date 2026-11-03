@@ -20,13 +20,30 @@ export type ArtifactView = {
  */
 export type PageView = {
   page: PublishedArtifact;
+  /** Which card of the chat it last loaded (`newestPage`). */
+  version: string;
   /** The Claude account whose session shows it. */
   account: string;
-  /** Which loading of the artifact it shows: Reload and a newer revision load it again. */
+  /** Which loading of the artifact it shows: Reload and a newer publish load it again. */
   load: string;
   mode: 'modal' | 'panel';
   focus: boolean;
 };
+
+/**
+ * The newest card of a claude.ai artifact in a chat, and what names it. Each reply counts its own
+ * revisions from one, so a later reply's card is newer whatever its revision says: a chat that
+ * publishes a page and changes it in later replies reads revision 1 again each time.
+ */
+export function newestPage(
+  messages: readonly { id: string; publishedArtifacts?: PublishedArtifact[] }[],
+  id: string,
+): { page: PublishedArtifact; version: string } | undefined {
+  for (let index = messages.length - 1; index >= 0; index--) {
+    const page = messages[index].publishedArtifacts?.find((card) => card.id === id);
+    if (page) return { page, version: `${messages[index].id}:${page.revision}` };
+  }
+}
 
 /** What a chat shows in the modal or beside it: a page of a reply, or a claude.ai artifact. */
 export type ShownArtifact = ArtifactView | PageView;

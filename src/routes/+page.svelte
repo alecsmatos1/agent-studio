@@ -354,7 +354,7 @@
   import { provideFileViewer } from '$lib/file-viewer.svelte';
   import { carriedSubagents, findSubagent, replyTools } from '$lib/subagents';
   import ClaudePageViewer from '$lib/components/ClaudePageViewer.svelte';
-  import { leaveChats, type ShownArtifact, type SubagentView } from '$lib/side-panels';
+  import { leaveChats, newestPage, type ShownArtifact, type SubagentView } from '$lib/side-panels';
   import { provideRecall, recalled, type ChatRecall } from '$lib/chat-recall';
   import { findPlace, holdAnchor, readPlace, type Anchor, type ChatPlace } from '$lib/chat-places';
   import { codeBlockAction, consoleShells, performCodeBlockAction } from '$lib/code-blocks';
@@ -776,14 +776,13 @@
   $effect(() => {
     const opened = artifactView;
     if (!opened) return;
-    // A claude.ai artifact published again loads again, whichever device ran the reply.
+    // A claude.ai artifact published again loads again, by whichever reply and device.
     if ('page' in opened) {
-      for (const message of active?.messages ?? []) {
-        const latest = message.publishedArtifacts?.find((a) => a.id === opened.page.id);
-        if (latest && latest.revision > opened.page.revision) {
-          opened.page = { ...latest };
-          opened.load = crypto.randomUUID();
-        }
+      const newest = newestPage(active?.messages ?? [], opened.page.id);
+      if (newest && newest.version !== opened.version) {
+        opened.page = { ...newest.page };
+        opened.version = newest.version;
+        opened.load = crypto.randomUUID();
       }
       return;
     }
@@ -827,7 +826,16 @@
       shown.focus = focus;
       return;
     }
-    artifactViews[chat] = { page, account, load: crypto.randomUUID(), mode: 'panel', focus };
+    // Its link shows the latest version, whichever reply's card opened it.
+    const newest = newestPage(active?.id === chat ? active.messages : [], page.id);
+    artifactViews[chat] = {
+      page: newest ? { ...newest.page } : page,
+      version: newest?.version ?? '',
+      account,
+      load: crypto.randomUUID(),
+      mode: 'panel',
+      focus,
+    };
     delete subagentViews[chat];
   }
   // The claude.ai sessions of accounts whose artifacts no chat shows close.
