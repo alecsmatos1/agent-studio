@@ -817,6 +817,8 @@ async fn stream_turn(
     let mut awaiting_follow_up = false;
     let mut steering: HashMap<String, crate::providers::steering::Delivery> = HashMap::new();
     let mut diagnostics = String::new();
+    // The mode the CLI last reported: an approved plan decision changes it during a reply.
+    let mut planning = request.agent.plan_mode;
     loop {
         let (answer_rx, steering_rx, elicitation_rx, take_over_rx, workflow_rx) =
             match questions.as_mut() {
@@ -1012,8 +1014,9 @@ async fn stream_turn(
                                 && matches!(value["subtype"].as_str(), Some("init" | "status"))
                                 && (value["session_id"].is_null() || value["session_id"].as_str() == Some(process.session_id.as_str())) {
                                 if let Some(mode) = value["permissionMode"].as_str().filter(|m| matches!(*m,"plan" | "bypassPermissions")) {
+                                    planning = mode == "plan";
                                     let mut effective = request.clone();
-                                    effective.agent.plan_mode = mode == "plan";
+                                    effective.agent.plan_mode = planning;
                                     if effective.native_session.is_some() { process.fingerprint = crate::pool::fingerprint(&effective, &process.exe)?; }
                                 }
                             }
@@ -1037,7 +1040,7 @@ async fn stream_turn(
                                     continue;
                                 }
                                 if value["request"]["subtype"] == "can_use_tool" {
-                                    let response = serde_json::json!({"type":"control_response","response":{"subtype":"success","request_id":value["request_id"],"response":{"behavior":"deny","message":"This action requires permission that is unavailable in the current mode. While planning, propose the change and request ExitPlanMode approval before implementation."}}});
+                                    let response = crate::providers::questions::refuse_tool(&value, planning);
                                     process.stdin.write_all(format!("{response}\n").as_bytes()).await.map_err(|_| send_failed)?;
                                     continue;
                                 }

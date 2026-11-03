@@ -11,7 +11,7 @@ use tokio::sync::{mpsc, oneshot};
 mod draft;
 mod plan_approval;
 pub use draft::Draft;
-pub use plan_approval::PlanApproval;
+pub use plan_approval::{refuse_tool, PlanApproval};
 
 pub const GUIDANCE: &str = "When you need clarification or a decision from the user, call studio_ask_user (Claude: mcp__agent_studio__studio_ask_user). Ask concise questions with stable ids and optional choices. Set multiSelect=false for one answer (radio buttons), or true only when multiple answers are allowed (checkboxes), independently for each question. Multiple questions do not imply multiple answers per question. The tool waits for explicitly submitted answers or a skip; never assume a default was accepted. Use it only in the parent conversation. Do not request passwords, tokens or other secrets. Native request_user_input and AskUserQuestion are also supported.";
 pub fn tool() -> Value {

@@ -96,6 +96,16 @@ while ($null -ne ($line = [Console]::ReadLine())) {
             [Console]::WriteLine('{"type":"result","subtype":"success","is_error":true,"num_turns":2,"result":"You''ve hit your session limit \u00b7 resets 1:50pm (America/Sao_Paulo)","usage":{"input_tokens":40,"output_tokens":2},"total_cost_usd":' + (Cost 0.001d) + '}')
             continue
         }
+        if ($mode -eq 'Refused') {
+            # Safety checks ask for a person under any mode; approved plan decisions change it.
+            foreach ($next in @('', 'plan', 'bypassPermissions')) {
+                if ($next) { [Console]::WriteLine('{"type":"system","subtype":"status","permissionMode":"' + $next + '"}') }
+                [Console]::WriteLine('{"type":"control_request","request_id":"ask' + $next + '","request":{"subtype":"can_use_tool","tool_name":"Bash","tool_use_id":"call","input":{},"decision_reason":"Dangerous rm operation","decision_reason_type":"safetyCheck"}}')
+                Add-Content -LiteralPath $settingsLog -Value ([Console]::ReadLine())
+            }
+            [Console]::WriteLine('{"type":"result","subtype":"success","is_error":false,"num_turns":1,"result":"Done","usage":{"input_tokens":1,"output_tokens":1}}')
+            continue
+        }
         if ($mode -eq 'Agents') {
             # A background agent works on after the turn ends.
             [Console]::WriteLine('{"type":"assistant","parent_tool_use_id":null,"message":{"id":"launch","content":[{"type":"tool_use","id":"agent-call","name":"Agent","input":{"description":"Researcher","prompt":"Research","run_in_background":true}}]}}')
@@ -250,6 +260,49 @@ async fn a_usage_limit_ends_the_reply_with_claude_codes_own_line() {
         RunEvent::Progress { text, .. } | RunEvent::Text { text } if text.contains("hit your"))));
     assert!(events.iter().any(|e| matches!(e, RunEvent::Usage { usage }
         if usage.model.as_deref() == Some("fixture-model") && usage.context_input == Some(100))));
+}
+
+#[tokio::test]
+async fn a_refused_tool_hears_of_planning_only_while_the_cli_reports_plan_mode() {
+    // A reply started in Build and one started in Plan differ until the CLI reports a mode.
+    for (plan_mode, first) in [(false, "Dangerous rm operation"), (true, "While planning")] {
+        let root = tempfile::tempdir().unwrap();
+        let conversation = uuid::Uuid::new_v4().to_string();
+        let mut request = request(
+            root.path(),
+            &conversation,
+            serde_json::json!([{"role":"user","text":"Refused"}]),
+        );
+        request.agent.plan_mode = plan_mode;
+        let session = request.native_session.as_ref().unwrap().id().to_string();
+        let mut process = fixture(root.path(), &session, false, false);
+        let (result, _) = turn(
+            &mut process,
+            &request,
+            CancellationToken::new(),
+            false,
+            false,
+        )
+        .await;
+        process.kill().await;
+        assert_eq!(result.unwrap().0, "complete");
+        let answers: Vec<_> = settings_input(root.path())
+            .into_iter()
+            .filter(|line| line["type"] == "control_response")
+            .map(|line| {
+                assert_eq!(line["response"]["response"]["behavior"], "deny");
+                line["response"]["response"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned()
+            })
+            .collect();
+        assert_eq!(answers.len(), 3, "{answers:?}");
+        assert!(answers[0].contains(first), "{answers:?}");
+        assert!(answers[1].contains("While planning"), "{answers:?}");
+        assert!(answers[2].contains("Dangerous rm operation"), "{answers:?}");
+        assert!(!answers[2].contains("planning"), "{answers:?}");
+    }
 }
 
 #[tokio::test]

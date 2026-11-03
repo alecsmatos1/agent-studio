@@ -19,12 +19,21 @@ async fn run_with(
     kept: bool,
 ) -> (Result<(String, String), String>, Vec<RunEvent>, bool) {
     let root = tempfile::tempdir().unwrap();
-    let runtime = root.path().join("chat-runtime");
+    run_in(root.path(), text, stop_while_waiting, kept).await
+}
+
+/// `run_with` with its data in a folder the caller keeps.
+async fn run_in(
+    root: &std::path::Path,
+    text: &str,
+    stop_while_waiting: bool,
+    kept: bool,
+) -> (Result<(String, String), String>, Vec<RunEvent>, bool) {
+    let runtime = root.join("chat-runtime");
     std::fs::create_dir_all(&runtime).unwrap();
     let mut request: RunRequest = serde_json::from_value(json!({"runId":uuid::Uuid::new_v4(),"agent":{"provider":"claude","model":"sonnet","instructions":""},"messages":[{"role":"user","text":text}]})).unwrap();
     request.conversation_id = Some(uuid::Uuid::new_v4().to_string());
-    request.native_session =
-        crate::providers::sessions::Session::prepare(root.path(), &request).unwrap();
+    request.native_session = crate::providers::sessions::Session::prepare(root, &request).unwrap();
     let exe = crate::providers::resolve("claude").await.unwrap();
     let mut command = crate::providers::chat_command(&request, &runtime, &exe)
         .await
@@ -171,6 +180,46 @@ async fn installed_claude_reply_waits_for_declared_tests_but_not_servers() {
         "Reply waited {:?} for the declared tests: {text}",
         started.elapsed()
     );
+}
+
+/// Claude Code wants a person for `rm` on a variable path even with permissions bypassed, and its
+/// reason says how to write the command: the reply corrects it and finishes, as it could not when
+/// the refusal said the session was planning.
+#[tokio::test]
+#[ignore = "Opt-in installed Claude CLI test; uses subscription capacity and a model's tool choice."]
+async fn installed_claude_corrects_a_command_its_safety_check_refuses() {
+    // The folder's long name: Claude Code also asks for a write under a Windows short name.
+    let temp = std::fs::canonicalize(std::env::temp_dir()).unwrap();
+    let root = tempfile::tempdir_in(temp.to_string_lossy().trim_start_matches(r"\\?\")).unwrap();
+    let (result, events, parkable) = run_in(root.path(), "Make a shots folder here with empty files a.png and b.png, clear the images out of it again and write done into shots/result.txt, then say what the folder holds. Start with this command in the Bash tool, and change it only if you have to:\n\nSRCD=$PWD/shots; mkdir -p $SRCD; touch $SRCD/a.png $SRCD/b.png; rm -f $SRCD/*.png; echo done > $SRCD/result.txt; ls $SRCD", false, false).await;
+    let (status, text) = result.expect("Installed CLI failed");
+    eprintln!("{:#?}\n{text}", outline(&events));
+    assert_eq!(status, "complete");
+    assert!(parkable);
+    assert!(!text.to_lowercase().contains("plan mode"), "{text}");
+    // The final state of each command: the refused one, then the one that replaced it.
+    let mut commands = vec![];
+    for event in &events {
+        if let RunEvent::Tool { tool } = event {
+            let tool = serde_json::to_value(tool).unwrap();
+            if tool["operation"] == "command" {
+                commands.retain(|(id, _)| *id != tool["id"]);
+                commands.push((tool["id"].clone(), tool["status"].clone()));
+            }
+        }
+    }
+    let states: Vec<_> = commands.iter().map(|(_, status)| status).collect();
+    assert_eq!(states, [&json!("error"), &json!("complete")], "{text}");
+    // A chat without a folder works in one of its own.
+    let shots = std::fs::read_dir(root.path().join("standalone"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path()
+        .join("shots");
+    assert!(shots.join("result.txt").is_file(), "{text}");
+    assert!(!shots.join("a.png").exists(), "{text}");
 }
 
 #[tokio::test]

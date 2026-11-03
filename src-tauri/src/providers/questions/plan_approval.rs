@@ -28,6 +28,25 @@ pub(super) fn response(value: &Value, answer: Option<&Answer>, error: Option<&st
     };
     json!({"type":"control_response","response":{"subtype":"success","request_id":value["request_id"],"response":result}})
 }
+/// Answers a permission request for a tool that no plan decision or question took. Claude Code
+/// asks while planning, but also with permissions bypassed: its safety checks want a person for
+/// `rm` on a variable path or a write under a Windows short name, as ask rules and hooks can. Nobody
+/// answers those prompts in a chat, so the agent gets Claude Code's own reason, which often says
+/// how to write the call. Telling it the session was planning made it stop and ask the user to
+/// turn off a plan mode that was never on.
+pub fn refuse_tool(value: &Value, planning: bool) -> Value {
+    let reason = value["request"]["decision_reason"]
+        .as_str()
+        .map(str::trim)
+        .filter(|reason| !reason.is_empty());
+    let message = match (planning, reason) {
+        (true, _) => "This action requires permission that is unavailable in the current mode. While planning, propose the change and request ExitPlanMode approval before implementation.".to_string(),
+        (false, Some(reason)) => format!("{ASKS_A_PERSON} Claude Code's reason: {reason}\nCorrect the call if that reason shows how. Otherwise leave it undone, without another route to the same effect, finish the rest of the work and tell the user what it needed."),
+        (false, None) => format!("{ASKS_A_PERSON}\nLeave the call undone, without another route to the same effect, finish the rest of the work and tell the user what it needed."),
+    };
+    json!({"type":"control_response","response":{"subtype":"success","request_id":value["request_id"],"response":{"behavior":"deny","message":message}}})
+}
+const ASKS_A_PERSON: &str = "Claude Code asks for a person's approval before this call, and Agent Studio does not give that approval, so the call did not run. The session's permission mode has not changed.";
 impl Session {
     pub(super) fn observe_plan(&mut self, value: &Value) {
         if value["type"] != "assistant" || !value["parent_tool_use_id"].is_null() {
@@ -156,6 +175,48 @@ mod tests {
                 id: "approval".into(),
                 values: vec![value.into()],
             }],
+        }
+    }
+    fn refusal(request: Value, planning: bool) -> String {
+        let answer = refuse_tool(
+            &json!({"type":"control_request","request_id":"asked","request":request}),
+            planning,
+        );
+        assert_eq!(answer["response"]["request_id"], "asked");
+        assert_eq!(answer["response"]["response"]["behavior"], "deny");
+        answer["response"]["response"]["message"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    }
+    #[test]
+    fn a_refused_tool_hears_claude_codes_reason_and_of_planning_only_while_planning() {
+        // As Claude Code 2.1.317 asks under bypassed permissions.
+        let reason = "Dangerous rm operation on possibly-empty variable path: $D/*.png in `rm -f $D/*.png` (rewrite it as \"${D:?}\"/*.png or use a literal path)";
+        let check = json!({"subtype":"can_use_tool","tool_name":"Bash","input":{"command":"rm -f $D/*.png"},"decision_reason":reason,"decision_reason_type":"safetyCheck","tool_use_id":"tool"});
+        let build = refusal(check.clone(), false);
+        assert!(build.contains(reason), "{build}");
+        assert!(build.contains("has not changed"));
+        assert!(!build.contains("planning"), "{build}");
+        assert!(!build.contains("ExitPlanMode"), "{build}");
+        // A request without a reason, as a rule's or an older CLI's, or with an empty one.
+        for request in [
+            json!({"subtype":"can_use_tool","tool_name":"Bash","decision_reason_type":"rule"}),
+            json!({"subtype":"can_use_tool","tool_name":"Bash","decision_reason":"  "}),
+        ] {
+            let build = refusal(request, false);
+            assert!(!build.contains("reason"), "{build}");
+            assert!(build.contains("did not run"));
+            assert!(!build.contains("planning"), "{build}");
+        }
+        // Planning, the mode is the reason, whatever else the CLI reports.
+        for request in [
+            check,
+            json!({"subtype":"can_use_tool","tool_name":"Write","decision_reason_type":"mode"}),
+        ] {
+            let planning = refusal(request, true);
+            assert!(planning.contains("While planning"), "{planning}");
+            assert!(planning.contains("ExitPlanMode"));
         }
     }
     #[tokio::test]
