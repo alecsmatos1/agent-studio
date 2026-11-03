@@ -5,7 +5,8 @@ import { expectVisibleQuotaComparison } from './quota-helper';
 
 // The fixture's `usage-pace` readings are halfway through their windows: 5-hour 70% used is
 // ahead of the even-use guide and Weekly 25% below it. A test can give an account percentages
-// of its own, and hold a provider's readings until it releases them.
+// of its own, leave limits out of its readings (`omit`), and hold a provider's readings until it
+// releases them.
 async function prepare(page: Page) {
   await mockDesktop(page, 'usage-pace');
   await page.addInitScript(() => {
@@ -19,13 +20,25 @@ async function prepare(page: Page) {
       const own = JSON.parse(
         localStorage.getItem(`test-usage-percent-${args.connectionId}`) ?? 'null',
       );
-      if (command === 'read_usage' && own)
+      if (command === 'read_usage' && own) {
+        result.windows = result.windows.filter(
+          (window: { label: string }) => !own.omit?.includes(window.label),
+        );
         for (const window of result.windows)
           if (window.label in own) window.usedPercent = own[window.label];
+      }
       return result;
     };
   });
 }
+
+const connectionNamed = (page: Page, name: string) =>
+  page.evaluate((name) => {
+    const fleet = JSON.parse(localStorage.getItem('test-workspace')!).fleet;
+    const account = fleet.accounts.find((a: { name: string }) => a.name === name);
+    return fleet.connections.find((c: { accountId: string }) => c.accountId === account.id)
+      .id as string;
+  }, name);
 
 // Adds a separate Claude profile in Connections, stays there, and returns its connection id.
 async function addAccount(page: Page, name: string) {
@@ -129,10 +142,10 @@ test('picker usage waits for its first reading and leaves out accounts to sign i
   const agent = page.getByRole('combobox', { name: 'Agent', exact: true });
   await agent.click();
   const codex = page.getByRole('option', { name: 'Codex', exact: true });
-  // Codex reports no 5-hour window until it is read, so only Weekly waits, in its own place.
-  await expect(codex.locator('.quota-bar')).toHaveText(['WeeklyChecking…']);
+  // Until it is read, an account's limits wait in their places, whatever its provider.
+  await expect(codex.locator('.quota-bar')).toHaveText(['5-hourChecking…', 'WeeklyChecking…']);
   await expect(codex.locator('.quota-bar.weekly')).toHaveCount(1);
-  await expect(codex.locator('.usage-meter')).toHaveClass(/unmeasured/);
+  await expect(codex.locator('.usage-meter.unmeasured')).toHaveCount(2);
   await page.evaluate(() => {
     const state = window as any;
     state.holdUsage = [];
@@ -192,4 +205,88 @@ test('a narrow Agent picker puts each account’s bars below its name', async ({
   expect(Math.round(bars.x)).toBe(Math.round(name.x));
   expect(bars.x + bars.width).toBeLessThanOrEqual(list.x + list.width);
   await page.screenshot({ path: 'artifacts/agent-usage-picker-narrow.png' });
+});
+
+test('limits an account’s reading leaves out show nowhere', async ({ page }) => {
+  await prepare(page);
+  await page.goto('/');
+  const second = await addAccount(page, 'Second Claude');
+  const login = await connectionNamed(page, 'Claude CLI login');
+  const codexId = await connectionOf(page, 'codex');
+  // A plan without a 5-hour limit, as Claude now has, an account whose weekly limit comes
+  // without a share used, and one that reports no limit at all.
+  await page.evaluate(
+    ({ second, login, codexId }) => {
+      const own = (id: string, value: object) =>
+        localStorage.setItem(`test-usage-percent-${id}`, JSON.stringify(value));
+      own(second, { omit: ['5-hour'], Weekly: 40 });
+      own(login, { Weekly: null });
+      own(codexId, { omit: ['5-hour', 'Weekly'] });
+    },
+    { second, login, codexId },
+  );
+  await page.getByRole('button', { name: 'Connections', exact: true }).click();
+  await chooseTestFolder(page);
+
+  const agent = page.getByRole('combobox', { name: 'Agent', exact: true });
+  await agent.click();
+  const other = page.getByRole('option', { name: 'Claude · Second Claude', exact: true });
+  const cli = page.getByRole('option', { name: 'Claude · Claude CLI login', exact: true });
+  const codex = page.getByRole('option', { name: 'Codex', exact: true });
+  const gemini = page.getByRole('option', { name: 'Gemini', exact: true });
+  await expect(other.locator('.quota-bar')).toHaveText(['Weekly40% used']);
+  await expect(cli.locator('.quota-bar')).toHaveText(['5-hour70% used']);
+  await expect(gemini.locator('.quota-bar')).toHaveText(['5-hour70% used', 'Weekly25% used']);
+  await expect(codex.locator('.quota-bars')).toHaveCount(0);
+  await expect(codex.locator('.option-aside')).toBeHidden();
+  await expect(page.getByRole('listbox')).not.toContainText('Not reported');
+  await expect(other).toHaveAccessibleDescription('Weekly 40% used Below pace');
+  // Weekly keeps its column, so the accounts still line up.
+  const weeklyX = async (option: typeof other) =>
+    Math.round((await option.locator('.quota-bar.weekly').boundingBox())!.x);
+  expect(await weeklyX(other)).toBe(await weeklyX(gemini));
+  await page.screenshot({ path: 'artifacts/agent-usage-unreported.png' });
+
+  // The composer shows the limits the chosen account has, and the rest fill the row.
+  await other.click();
+  await expect(agent).toHaveText(/Claude · Second Claude/);
+  await page.getByRole('combobox', { name: 'Model', exact: true }).click();
+  await page.getByRole('option', { name: 'Sonnet', exact: true }).click();
+  const strip = page.locator('.composer-area .usage-strip');
+  await expect(strip.getByRole('button')).toHaveCount(2);
+  await expect(strip.getByRole('progressbar', { name: '5-hour limit used' })).toHaveCount(0);
+  await expect(strip.getByRole('progressbar', { name: 'Weekly limit used' })).toHaveAttribute(
+    'aria-valuenow',
+    '40',
+  );
+  await expect(strip).not.toContainText('Not reported');
+  const widths = await strip
+    .getByRole('button')
+    .evaluateAll((chips) => chips.map((chip) => Math.round(chip.getBoundingClientRect().width)));
+  expect(Math.abs(widths[0] - widths[1])).toBeLessThanOrEqual(1);
+  await page.locator('.context-chip').click();
+  await expect(page.getByTestId('limit-5-hour')).toHaveCount(0);
+  await expect(page.getByTestId('limit-weekly')).toContainText('40%');
+  await page.screenshot({ path: 'artifacts/composer-usage-unreported.png' });
+  await page.keyboard.press('Escape');
+  // Fable's own weekly limit joins the weekly one.
+  await page.getByRole('combobox', { name: 'Model', exact: true }).click();
+  await page.getByRole('option', { name: 'Fable', exact: true }).click();
+  await expect(strip.locator('.usage-chip .usage-bar-heading > span:first-child')).toHaveText([
+    'Context',
+    'Weekly',
+    'Fable weekly',
+  ]);
+
+  // Connections lists the same limits for each account.
+  await page.getByRole('button', { name: 'Connections', exact: true }).click();
+  const usage = (name: string) =>
+    page.getByRole('region', { name: `Usage for ${name}`, exact: true });
+  const labels = (name: string) =>
+    usage(name).locator('.account-limit .limit-heading > span:first-child');
+  await expect(labels('Second Claude')).toHaveText(['Weekly', 'Fable weekly']);
+  await expect(labels('Claude CLI login')).toHaveText(['5-hour', 'Fable weekly']);
+  await expect(labels('Codex CLI login')).toHaveCount(0);
+  await expect(usage('Codex CLI login')).toContainText('No limits reported.');
+  await expect(page.locator('.account-limit', { hasText: 'Not reported' })).toHaveCount(0);
 });

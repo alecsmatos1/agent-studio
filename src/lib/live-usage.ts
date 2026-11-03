@@ -138,6 +138,9 @@ export function mergeLiveUsage(
   return {
     ...previous,
     ...update.snapshot,
+    // An update names only the limits it concerns: without an earlier reading, which limits the
+    // account has stays unknown until a read-only reading lists them.
+    ...(previous ? {} : { partial: true }),
     connectionId: update.connectionId,
     checkedAt: Math.max(previous?.checkedAt ?? 0, update.snapshot.checkedAt),
     windows: [...windows.values()],

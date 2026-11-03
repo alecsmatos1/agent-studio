@@ -83,7 +83,14 @@ export function accountChanges(message?: Message) {
   const before = observation?.before,
     after = observation?.after;
   if (!before || !after || after.checkedAt < before.checkedAt) return [];
-  const rows: { label: string; value: string }[] = before.windows.map((w) => {
+  // A limit neither reading reports with a share used is not shown, as the usage bars show none
+  // (docs/USAGE.md); one reported by only one of them is not comparable.
+  const reported = before.windows.filter(
+    (w) =>
+      w.usedPercent != null ||
+      after.windows.some((n) => n.id === w.id && n.usedPercent != null),
+  );
+  const rows: { label: string; value: string }[] = reported.map((w) => {
     const next = after.windows.find((n) => n.id === w.id);
     const end = resetMs(w.resetsAt);
     const valid =

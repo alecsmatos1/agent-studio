@@ -74,6 +74,15 @@ describe('transient account push', () => {
     expect(quotaPace(merged.windows[1], merged, 2000000).state).toBe('unknown');
     expect(canResetUsage(merged)).toBe(true);
   });
+  it('leaves the account’s limits unknown while live updates alone make its snapshot', () => {
+    const first = mergeLiveUsage(undefined, update());
+    expect(first.partial).toBe(true);
+    expect(mergeLiveUsage(first, update()).partial).toBe(true);
+    // An update merged into a reading keeps every limit the reading listed.
+    const merged = mergeLiveUsage(baseline(), update());
+    expect(merged.partial).toBeUndefined();
+    expect(merged.windows).toHaveLength(2);
+  });
   it('preserves reset credits and sparse credit fields, without reviving an old credit reading', () => {
     const incoming = update();
     incoming.snapshot.credits = {

@@ -58,8 +58,9 @@
   });
   const context = $derived(contextFor(conversation, settings, '', model, snapshot));
   const credits = $derived(creditReading(settings.provider, snapshot));
+  // Only the limits a reading reports, which wait as Checking… while a first one loads.
   const limits = $derived(
-    visibleLimits(snapshot, settings).map((window) => ({
+    visibleLimits(snapshot, settings, loading).map((window) => ({
       ...window,
       pace: quotaPace(window, snapshot, now, !!error),
     })),
@@ -80,7 +81,9 @@
         : state === 'unknown'
           ? 'unknown'
           : 'up';
-  const stale = $derived(!!error || limits.some((w) => isStale(snapshot, w, now)));
+  const stale = $derived(
+    !!snapshot && (!!error || limits.some((w) => isStale(snapshot, w, now))),
+  );
   const contextValue = $derived(
     context.reported == null
       ? 'Not measured yet'
@@ -100,18 +103,18 @@
     class:over-guide={window.pace.expectedPercent != null &&
       window.usedPercent != null &&
       window.usedPercent > window.pace.expectedPercent}
-    title={window.pace.expectedPercent == null || window.usedPercent == null
-      ? window.pace.detail
-      : `${percentage(window.usedPercent)} used; recommended ${percentage(window.pace.expectedPercent)} at the time of this reading.`}
+    title={window.usedPercent == null
+      ? undefined
+      : window.pace.expectedPercent == null
+        ? window.pace.detail
+        : `${percentage(window.usedPercent)} used; recommended ${percentage(window.pace.expectedPercent)} at the time of this reading.`}
     role={compact ? 'progressbar' : 'meter'}
     aria-label={`${window.label} limit used`}
     aria-valuemin="0"
     aria-valuemax="100"
     aria-valuenow={window.usedPercent == null ? undefined : clampPercent(window.usedPercent)}
     aria-valuetext={window.usedPercent == null
-      ? loading && !snapshot
-        ? 'Checking usage'
-        : 'Not reported'
+      ? 'Checking usage'
       : `${percentage(window.usedPercent)} used${window.pace.expectedPercent == null ? '' : `, recommended ${percentage(window.pace.expectedPercent)}`}${isStale(snapshot, window, now) || error ? ', last reported' : ''}`}
   >
     {#if window.usedPercent != null}<i
@@ -170,7 +173,9 @@
         class="usage-chip"
         class:usage-warning={window.pace.tone === 'watch' || window.pace.tone === 'danger'}
         onclick={() => (expanded = !expanded)}
-        title={`${isStale(snapshot, window, now) || error ? 'Last reported. ' : ''}${resetLabel(window.resetsAt, now)}. ${window.pace.label}. ${window.pace.advice}`}
+        title={window.usedPercent == null
+          ? undefined
+          : `${isStale(snapshot, window, now) || error ? 'Last reported. ' : ''}${resetLabel(window.resetsAt, now)}. ${window.pace.label}. ${window.pace.advice}`}
         aria-expanded={expanded}
         aria-controls="usage-details"
         aria-label={`Show ${window.label} usage details. ${window.pace.label}`}
@@ -179,9 +184,7 @@
           ><span>{window.label}</span><span class="usage-bar-value"
             ><strong
               >{window.usedPercent == null
-                ? loading && !snapshot
-                  ? 'Checking…'
-                  : 'Not reported'
+                ? 'Checking…'
                 : `${percentage(window.usedPercent)} used`}</strong
             >
             {#if window.pace.state !== 'unknown'}<PaceIndicator
@@ -196,7 +199,7 @@
       </button>
     {/each}
   </div>
-  {#if stale}<span class="usage-stale">Last reported</span>{/if}
+  {#if stale && limits.length}<span class="usage-stale">Last reported</span>{/if}
   {#if expanded}
     <div id="usage-details" class="usage-details">
       <div class="usage-details-heading">
@@ -292,18 +295,19 @@
                 >{/if}
             </div>
             <strong
-              >{window.usedPercent == null ? 'Not reported' : percentage(window.usedPercent)}<small
+              >{window.usedPercent == null ? 'Checking…' : percentage(window.usedPercent)}<small
                 >{window.usedPercent != null ? ' used' : ''}</small
               ></strong
             >
-            {#if window.usedPercent != null}{@render quotaBar(window)}{/if}
-            <p
-              title={resetTime(window.resetsAt)
-                ? new Date(resetTime(window.resetsAt)!).toLocaleString()
-                : ''}
-            >
-              {resetLabel(window.resetsAt, now)}
-            </p>
+            {#if window.usedPercent != null}{@render quotaBar(window)}
+              <p
+                title={resetTime(window.resetsAt)
+                  ? new Date(resetTime(window.resetsAt)!).toLocaleString()
+                  : ''}
+              >
+                {resetLabel(window.resetsAt, now)}
+              </p>
+            {/if}
             <div class="pace-details" data-testid="quota-pace">
               <PaceIndicator
                 label={window.pace.label}

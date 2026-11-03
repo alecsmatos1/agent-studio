@@ -37,11 +37,16 @@
     const timer = setInterval(() => (now = Date.now()), 15_000);
     return () => clearInterval(timer);
   });
+  // Only the limits a reading reports show. Until the account's first reading, which a connected
+  // account is about to have, the limits it may have wait as Checking…, though not while one
+  // that failed is tried again.
   const limits = $derived(
-    accountLimits(snapshot, provider).map((window) => ({
-      ...window,
-      pace: quotaPace(window, snapshot, now, !!error || !!unavailable),
-    })),
+    accountLimits(snapshot, provider, !error && (loading || (!snapshot && !unavailable))).map(
+      (window) => ({
+        ...window,
+        pace: quotaPace(window, snapshot, now, !!error || !!unavailable),
+      }),
+    ),
   );
   const stale = $derived(
     !!snapshot && (!!error || !!unavailable || limits.some((w) => isStale(snapshot, w, now))),
@@ -73,9 +78,7 @@
             <span>{window.label}</span>
             <strong
               >{window.usedPercent == null
-                ? loading && !snapshot
-                  ? 'Checking…'
-                  : 'Not reported'
+                ? 'Checking…'
                 : `${percentage(window.usedPercent)} used`}</strong
             >
             <PaceIndicator
@@ -103,11 +106,13 @@
             aria-valuemax="100"
             aria-valuenow={window.usedPercent == null ? undefined : clamp(window.usedPercent)}
             aria-valuetext={window.usedPercent == null
-              ? 'Not reported'
+              ? 'Checking usage'
               : `${percentage(window.usedPercent)} used${window.pace.expectedPercent == null ? '' : `, recommended ${percentage(window.pace.expectedPercent)}`}${stale ? ', last reported' : ''}`}
-            title={window.pace.expectedPercent == null
-              ? window.pace.detail
-              : `${percentage(window.usedPercent!)} used; recommended ${percentage(window.pace.expectedPercent)} at the time of this reading.`}
+            title={window.usedPercent == null
+              ? undefined
+              : window.pace.expectedPercent == null
+                ? window.pace.detail
+                : `${percentage(window.usedPercent)} used; recommended ${percentage(window.pace.expectedPercent)} at the time of this reading.`}
           >
             {#if window.usedPercent != null}<i
                 class={`quota-fill tone-${window.pace.tone}`}
@@ -119,17 +124,17 @@
                 aria-hidden="true"
               ></span>{/if}
           </div>
-          <div class="limit-meta">
-            <span
-              title={resetTime(window.resetsAt)
-                ? new Date(resetTime(window.resetsAt)!).toLocaleString()
-                : undefined}>{resetLabel(window.resetsAt, now)}</span
-            >
-            {#if window.pace.allowance != null && window.pace.state !== 'exhausted'}<span
-                title="Remaining share of the full limit available per hour or day until reset."
-                >Budget {percentage(window.pace.allowance)}/{window.pace.allowanceUnit}</span
-              >{/if}
-          </div>
+          {#if window.usedPercent != null}<div class="limit-meta">
+              <span
+                title={resetTime(window.resetsAt)
+                  ? new Date(resetTime(window.resetsAt)!).toLocaleString()
+                  : undefined}>{resetLabel(window.resetsAt, now)}</span
+              >
+              {#if window.pace.allowance != null && window.pace.state !== 'exhausted'}<span
+                  title="Remaining share of the full limit available per hour or day until reset."
+                  >Budget {percentage(window.pace.allowance)}/{window.pace.allowanceUnit}</span
+                >{/if}
+            </div>{/if}
           {#if window.pace.state === 'exhausted'}<p class={`limit-advice tone-${window.pace.tone}`}>
               {window.pace.advice}
             </p>{/if}
@@ -142,9 +147,7 @@
   {#if unavailable || error}<p class="usage-note" role="status">
       {unavailable || error}
     </p>
-  {:else if !loading && snapshot && limits.every((window) => window.usedPercent == null)}<p
-      class="usage-note"
-    >
+  {:else if !loading && snapshot && !snapshot.partial && !limits.length}<p class="usage-note">
       No limits reported.
     </p>{/if}
 </section>

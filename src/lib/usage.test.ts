@@ -11,6 +11,7 @@ import {
   resetTime,
   snapshotFor,
   visibleLimits,
+  type LimitWindow,
   type UsageSnapshot,
 } from './usage';
 import { automaticModel } from './models';
@@ -155,7 +156,13 @@ describe('usage and context semantics', () => {
       ['Weekly', 31],
       ['Fable weekly', 62],
     ]);
-    expect(accountLimits(undefined, 'codex').map((w) => w.usedPercent)).toEqual([null]);
+    // Without a reading nothing shows; while the first is under way the account's limits wait,
+    // whatever the provider.
+    expect(accountLimits(undefined, 'codex')).toEqual([]);
+    expect(accountLimits(undefined, 'codex', true).map((w) => [w.label, w.usedPercent])).toEqual([
+      ['5-hour', null],
+      ['Weekly', null],
+    ]);
     const spark = {
       ...snapshot.windows[0],
       id: 'spark',
@@ -170,7 +177,6 @@ describe('usage and context semantics', () => {
     };
     expect(accountLimits(codex, 'codex').map((w) => [w.label, w.usedPercent])).toEqual([
       ['5-hour', 0],
-      ['Weekly', null],
       ['Spark · 5-hour', 99],
     ]);
     const scoped = { ...snapshot, connectionId: 'first-account' };
@@ -244,7 +250,89 @@ describe('usage and context semantics', () => {
     expect(visibleLimits(codex, { ...settings, model: 'gpt-5.3-codex-spark' })[0].usedPercent).toBe(
       0,
     );
-    expect(visibleLimits(undefined, settings).every((w) => w.usedPercent == null)).toBe(true);
+    expect(visibleLimits(undefined, settings)).toEqual([]);
+  });
+  it('shows only the limits a reading reports, whatever the provider and window', () => {
+    const sonnet = { ...settings, provider: 'claude' as const, model: 'sonnet' };
+    const fable = { ...sonnet, model: 'fable' };
+    const [fiveHour, weekly, fableWeekly] = snapshot.windows;
+    const labels = (windows: LimitWindow[]) => windows.map((w) => w.label);
+    // A Claude plan without a 5-hour limit, as Claude Code now reports some: no 5-hour bar.
+    const noFiveHour = { ...snapshot, windows: [weekly, fableWeekly] };
+    expect(labels(visibleLimits(noFiveHour, sonnet))).toEqual(['Weekly']);
+    expect(labels(visibleLimits(noFiveHour, fable))).toEqual(['Weekly', 'Fable weekly']);
+    expect(labels(accountLimits(noFiveHour, 'claude'))).toEqual(['Weekly', 'Fable weekly']);
+    // A later reading under way keeps to the limits the last one reported.
+    expect(labels(visibleLimits(noFiveHour, sonnet, true))).toEqual(['Weekly']);
+    // No weekly limit, or one named without a share used.
+    const noWeekly = { ...snapshot, windows: [fiveHour, { ...weekly, usedPercent: null }] };
+    expect(labels(visibleLimits(noWeekly, sonnet))).toEqual(['5-hour']);
+    expect(labels(accountLimits(noWeekly, 'claude'))).toEqual(['5-hour']);
+    // A Fable model whose account reports no Fable limit.
+    expect(labels(visibleLimits({ ...snapshot, windows: [fiveHour, weekly] }, fable))).toEqual([
+      '5-hour',
+      'Weekly',
+    ]);
+    // Gemini the same way.
+    const gemini = { ...snapshot, provider: 'gemini', windows: [{ ...weekly, bucket: 'gemini' }] };
+    expect(labels(visibleLimits(gemini, { ...settings, provider: 'gemini' }))).toEqual(['Weekly']);
+    // A reading without limits, as an API key's: none at all.
+    const none = { ...snapshot, windows: [] };
+    expect(visibleLimits(none, sonnet, true)).toEqual([]);
+    expect(accountLimits(none, 'claude', true)).toEqual([]);
+  });
+  it('lets limits wait only for a first reading, which live updates alone do not replace', () => {
+    const sonnet = { ...settings, provider: 'claude' as const, model: 'sonnet' };
+    const values = (windows: LimitWindow[]) => windows.map((w) => [w.label, w.usedPercent]);
+    expect(values(visibleLimits(undefined, sonnet, true))).toEqual([
+      ['5-hour', null],
+      ['Weekly', null],
+    ]);
+    expect(
+      values(visibleLimits(undefined, { ...sonnet, provider: 'codex', model: '' }, true)),
+    ).toEqual([
+      ['5-hour', null],
+      ['Weekly', null],
+    ]);
+    expect(visibleLimits(undefined, { ...sonnet, model: 'fable' }, true)).toHaveLength(3);
+    // A live update names only the limit it concerns: the others wait for the reading under way
+    // and stay hidden without one.
+    const live: UsageSnapshot = {
+      ...snapshot,
+      partial: true,
+      windows: [{ ...snapshot.windows[0], usedPercent: 40 }],
+    };
+    expect(values(visibleLimits(live, sonnet, true))).toEqual([
+      ['5-hour', 40],
+      ['Weekly', null],
+    ]);
+    expect(values(visibleLimits(live, sonnet))).toEqual([['5-hour', 40]]);
+  });
+  it('fills an account’s newer live updates in from its complete reading', () => {
+    const settings = { provider: 'claude' as const, model: '', connectionId: 'one' };
+    const reading = { ...snapshot, connectionId: 'one', windows: snapshot.windows.slice(0, 2) };
+    const live: UsageSnapshot = {
+      ...snapshot,
+      connectionId: 'one',
+      partial: true,
+      checkedAt: 1200,
+      windows: [{ ...snapshot.windows[0], usedPercent: 40, checkedAt: 1200 }],
+    };
+    const account = snapshotFor({ 'claude:opus:one': reading, 'claude::one': live }, settings)!;
+    expect(account.partial).toBeUndefined();
+    // Each limit as old as the reading that reported it.
+    expect(account.windows.map((w) => [w.id, w.usedPercent, w.checkedAt])).toEqual([
+      ['5h', 40, 1200],
+      ['week', 31, 1000],
+    ]);
+    // Without a complete reading the account's other limits stay unknown.
+    expect(snapshotFor({ 'claude::one': live }, settings)?.partial).toBe(true);
+    // A newer complete reading is the account's own.
+    const newer = { ...reading, checkedAt: 1300 };
+    expect(snapshotFor({ 'claude:opus:one': newer, 'claude::one': live }, settings)).toEqual({
+      ...newer,
+      context: null,
+    });
   });
   it('normalizes reset times and marks old or elapsed readings as stale', () => {
     expect(resetTime('2026-09-08T12:00:00Z')).toBe(Date.parse('2026-09-08T12:00:00Z'));

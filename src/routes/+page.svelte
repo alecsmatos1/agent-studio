@@ -1588,6 +1588,22 @@
 
   const selectedUsageKey = $derived(usageKey(selectedSettings));
   const selectedUsage = $derived(snapshotFor(usageSnapshots, selectedSettings));
+  // Whether the selected account's first reading is under way or due, which its bars below the
+  // composer wait for as Checking…; a reading then says which limits it has, and only those
+  // show. One that failed leaves none waiting while it is tried again.
+  const selectedUsageChecking = $derived.by(() => {
+    if (usageErrors[selectedUsageKey] || (selectedUsage && !selectedUsage.partial)) return false;
+    const { provider, connectionId } = selectedSettings;
+    if (usageLoading[selectedUsageKey] || canQueryConnection(connectionId, provider)) return true;
+    // An account here is read as soon as its check answers.
+    const connection = workspace.fleet.connections.find((c) => c.id === connectionId);
+    return (
+      !!connection &&
+      desktop() &&
+      executionHost(workspace.fleet, connection.environmentId) === installation?.id &&
+      !connectionStatuses[connection.id]
+    );
+  });
   const accountUsageTargets = $derived.by(() =>
     workspace.fleet.connections.flatMap((connection) => {
       const account = workspace.fleet.accounts.find((a) => a.id === connection.accountId);
@@ -1610,16 +1626,19 @@
     const key = accountUsageTargetKey;
     if (loaded && view === 'connections' && key) untrack(() => void refreshAccountUsage());
   });
+  const selectedConnectionAvailable = $derived(canQueryConnection(selectedSettings.connectionId));
+  // The selected account is read when chosen and again once its check finds it ready, as at
+  // startup, so its bars do not wait for the next minute's reading.
   $effect(() => {
     const provider = selectedSettings.provider;
     const model = selectedSettings.model;
     const connectionId = selectedSettings.connectionId;
-    if (loaded && view === 'chat')
+    const available = selectedConnectionAvailable;
+    if (loaded && view === 'chat' && available)
       untrack(() => void refreshUsage({ provider, model, connectionId }));
   });
   const selectedModelScope = $derived(modelScopeKey(selectedSettings));
   const selectedModelReady = $derived(!!active || !!selectedLocation);
-  const selectedConnectionAvailable = $derived(canQueryConnection(selectedSettings.connectionId));
   $effect(() => {
     const key = selectedModelScope;
     const ready = selectedModelReady;
@@ -8390,7 +8409,7 @@
               settings={selectedSettings}
               model={currentModel}
               snapshot={selectedUsage}
-              loading={!!usageLoading[selectedUsageKey]}
+              loading={selectedUsageChecking}
               error={usageErrors[selectedUsageKey] ?? ''}
               preview={!desktop() && !paired}
               accountName={workspace.fleet.accounts.find(a => a.id === workspace.fleet.connections.find(c => c.id === selectedSettings.connectionId)?.accountId)?.name}

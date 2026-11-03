@@ -613,7 +613,8 @@ test('Connections shows separate account quotas, refresh progress, and retained 
   await expect(meter('Claude CLI login')).toHaveAttribute('aria-valuenow', '25');
   await expect(meter('Second Claude')).toHaveAttribute('aria-valuenow', '80');
   await expect(meter('Codex CLI login')).toHaveAttribute('aria-valuenow', '0');
-  await expect(meter('Codex CLI login', 'Weekly')).not.toHaveAttribute('aria-valuenow');
+  // A limit reported without a share used is not shown, nor any for an account without one.
+  await expect(meter('Codex CLI login', 'Weekly')).toHaveCount(0);
   await expect(usage('Second Claude')).toContainText('Budget');
   const resetDate = await page.evaluate((id) => {
     const reset = (window as any).usageReadings[id].windows[1].resetsAt;
@@ -631,7 +632,8 @@ test('Connections shows separate account quotas, refresh progress, and retained 
   await expect(usage('Second Claude').locator('[title*="less until reset"]')).toHaveCount(0);
   await expect(usage('Second Claude').getByRole('img', { name: 'Ahead of pace' })).toBeVisible();
   await expect(usage('Claude CLI login').getByRole('img', { name: 'Below pace' })).toBeVisible();
-  await expect(usage('Gemini CLI login')).toContainText('Not reported');
+  await expect(usage('Gemini CLI login')).toContainText('No limits reported.');
+  await expect(usage('Gemini CLI login').getByRole('progressbar')).toHaveCount(0);
   await expect(usage('Gemini CLI login')).not.toContainText('0%');
   await expect(usage('Claude CLI login')).not.toContainText('Context');
   await expectVisibleQuotaComparison(meter('Second Claude'), true);
@@ -658,7 +660,8 @@ test('Connections shows separate account quotas, refresh progress, and retained 
   await expect(meter('Second Claude')).toHaveAttribute('aria-valuenow', '80');
   await expect(meter('Claude CLI login')).toHaveAttribute('aria-valuenow', '35');
   await expect(meter('Codex CLI login')).toHaveCount(0);
-  await expect(meter('Codex CLI login', 'Weekly')).toBeVisible();
+  await expect(meter('Codex CLI login', 'Weekly')).toHaveCount(0);
+  await expect(usage('Codex CLI login')).toContainText('No limits reported.');
   await page.evaluate((id) => {
     const w = window as any;
     w.failUsageConnections = [id];

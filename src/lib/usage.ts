@@ -25,6 +25,11 @@ export type LimitWindow = {
 };
 export type UsageSnapshot = {
   creditsCheckedAt?: number;
+  /**
+   * Made from live account updates alone, which name only the limits they concern, so it does
+   * not say which limits its account has. A read-only reading lists them all.
+   */
+  partial?: boolean;
   live?: {
     accountChanged: string;
     authMode: string | null;
@@ -153,16 +158,32 @@ export function snapshotFor(
 ): UsageSnapshot | undefined {
   const exact = snapshots[usageKey(settings)];
   let latest = exact;
+  // The newest reading that lists every limit of the account.
+  let complete = exact?.partial ? undefined : exact;
   for (const snapshot of Object.values(snapshots)) {
-    if (
-      snapshot.provider === settings.provider &&
-      snapshot.connectionId === settings.connectionId &&
-      (!latest || snapshot.checkedAt > latest.checkedAt)
-    )
-      latest = snapshot;
+    if (snapshot.provider !== settings.provider || snapshot.connectionId !== settings.connectionId)
+      continue;
+    if (!latest || snapshot.checkedAt > latest.checkedAt) latest = snapshot;
+    if (!snapshot.partial && (!complete || snapshot.checkedAt > complete.checkedAt))
+      complete = snapshot;
   }
+  if (!latest) return undefined;
   // Account quotas belong to the provider; context capacities belong to the selected model.
-  return latest ? { ...latest, context: exact?.context ?? null } : undefined;
+  const account = { ...latest, context: exact?.context ?? null };
+  // Newer live updates name only the limits they concern; the account's other limits are those
+  // its newest complete reading lists, each as old as that reading.
+  const reading = complete;
+  if (account.partial && reading) {
+    const newer = new Set(account.windows.map((window) => window.id));
+    account.windows = [
+      ...account.windows,
+      ...reading.windows
+        .filter((window) => !newer.has(window.id))
+        .map((window) => ({ ...window, checkedAt: window.checkedAt ?? reading.checkedAt })),
+    ];
+    delete account.partial;
+  }
+  return account;
 }
 export const compactTokens = (n: number) =>
   new Intl.NumberFormat('en', { notation: 'compact', maximumFractionDigits: 1 }).format(n);
@@ -192,10 +213,21 @@ export function isFable(settings: ChatSettings, snapshot?: UsageSnapshot) {
     /fable/i.test(settings.model || snapshot?.context?.model || '')
   );
 }
+/** Whether a reading reports a limit, with the share of it used. */
+const reported = (window: LimitWindow) => window.usedPercent != null;
+/**
+ * The limits a chat's usage bars show: its account's 5-hour and weekly limits, and Fable weekly
+ * for a Fable model, each only as the account's reading reports it. A limit the reading leaves
+ * out, or names without a share used, is not shown, whatever the provider and window: Claude
+ * dropped the 5-hour limit from some plans, and most Codex accounts report none. Only while a
+ * first reading of the account is under way or due (`checking`), and none it has lists all its
+ * limits, do the limits it may have wait in their places, unmeasured.
+ */
 export function visibleLimits(
   snapshot: UsageSnapshot | undefined,
   settings: ChatSettings,
-): (LimitWindow & { available: boolean })[] {
+  checking = false,
+): LimitWindow[] {
   let windows = snapshot?.windows ?? [];
   if (settings.provider === 'codex') {
     const scoped = windows.filter(
@@ -213,18 +245,18 @@ export function visibleLimits(
       ? [{ id: 'fable-weekly', label: 'Fable weekly', minutes: 10080, model: 'fable' }]
       : []),
   ];
-  return expected
-    .map((e) => {
-      const window = windows.find(
-        (w) =>
-          w.windowMinutes === e.minutes &&
-          (e.model
-            ? w.model?.toLowerCase() === e.model
-            : !w.model || settings.provider === 'codex'),
-      );
-      return window
-        ? { ...window, available: window.usedPercent != null }
-        : {
+  const waiting = checking && (!snapshot || !!snapshot.partial);
+  return expected.flatMap((e): LimitWindow[] => {
+    const window = windows.find(
+      (w) =>
+        reported(w) &&
+        w.windowMinutes === e.minutes &&
+        (e.model ? w.model?.toLowerCase() === e.model : !w.model || settings.provider === 'codex'),
+    );
+    if (window) return [window];
+    return waiting
+      ? [
+          {
             id: e.id,
             label: e.label,
             windowMinutes: e.minutes,
@@ -232,13 +264,10 @@ export function visibleLimits(
             usedPercent: null,
             resetsAt: null,
             bucket: settings.provider,
-            available: false,
-          };
-    })
-    .filter((window) => showLimit(window, settings.provider));
-}
-function showLimit(window: LimitWindow, provider: string) {
-  return provider !== 'codex' || window.windowMinutes !== 300 || window.usedPercent != null;
+          },
+        ]
+      : [];
+  });
 }
 export function isStale(snapshot: UsageSnapshot | undefined, window: LimitWindow, now: number) {
   if (!snapshot) return false;
@@ -248,20 +277,28 @@ export function isStale(snapshot: UsageSnapshot | undefined, window: LimitWindow
     (reset != null && now >= reset && (window.checkedAt ?? snapshot.checkedAt) * 1000 < reset)
   );
 }
-// An account view has no selected chat model. Keep model-specific quotas explicitly labelled.
-export function accountLimits(snapshot: UsageSnapshot | undefined, provider: ProviderId) {
-  const primary = visibleLimits(snapshot, { provider, model: '', reasoning: '', instructions: '' });
+// An account view has no selected chat model. Keep model-specific quotas explicitly labelled,
+// and like the chat's bars, only those the reading reports.
+export function accountLimits(
+  snapshot: UsageSnapshot | undefined,
+  provider: ProviderId,
+  checking = false,
+): LimitWindow[] {
+  const primary = visibleLimits(
+    snapshot,
+    { provider, model: '', reasoning: '', instructions: '' },
+    checking,
+  );
   return [
     ...primary,
     ...(snapshot?.windows ?? [])
-      .filter((window) => showLimit(window, provider) && !primary.some((p) => p.id === window.id))
+      .filter((window) => reported(window) && !primary.some((p) => p.id === window.id))
       .map((window) => ({
         ...window,
         label:
           window.model && !window.label.toLowerCase().includes(window.model.toLowerCase())
             ? `${window.model} · ${window.label}`
             : window.label,
-        available: window.usedPercent != null,
       })),
   ];
 }

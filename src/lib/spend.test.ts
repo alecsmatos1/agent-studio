@@ -104,6 +104,20 @@ describe('chat spend tracking', () => {
     m.accountUsage.after = null;
     expect(accountChanges(m)).toEqual([]);
   });
+  it('leaves out a limit neither reading reports with a share used', () => {
+    const m = reply();
+    m.accountUsage = observed(m.runId!);
+    const fiveHour = { id: 'five-hour', label: '5-hour', resetsAt: 1000, usedPercent: null };
+    m.accountUsage.before!.windows.push(fiveHour);
+    m.accountUsage.after!.windows.push({ ...fiveHour });
+    expect(accountChanges(m).map((row) => row.label)).toEqual(['Weekly', 'Account credit balance']);
+    // Reported by one reading alone, it cannot be compared.
+    m.accountUsage.after!.windows[1].usedPercent = 4;
+    expect(accountChanges(m)[1]).toEqual({
+      label: '5-hour',
+      value: 'Not comparable (reset or missing reading)',
+    });
+  });
   it('accepts only bounded, current-run observations and retains the final revision', () => {
     const m = reply();
     const final = observed(m.runId!);
