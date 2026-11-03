@@ -923,7 +923,7 @@ impl RunRequest {
         let tools = if self.tools_enabled() {
             // Every chat agent names its fences' languages, so the commands it gives can run in
             // a console. A Codex chat with Agent Studio's tools shows an artifact from a file, a
-            // Claude chat publishes one to claude.ai when asked, and otherwise a fence holds it.
+            // Claude chat publishes one to claude.ai, and otherwise a fence holds it.
             let delivery = if self.uses_claude_visualizer() {
                 crate::artifacts::Delivery::ClaudeAi
             } else if studio_tools && self.uses_codex_server() {
@@ -998,6 +998,9 @@ impl RunRequest {
             let mut context = Vec::new();
             if let Some(provider) = session.imported() {
                 context.push(self.import_guidance(provider));
+            }
+            if session.pages_rule_changed && self.uses_claude_visualizer() {
+                context.push(crate::artifacts::pages_rule_changed());
             }
             if session.instructions_changed {
                 context.push(format!("Current user instructions for this conversation (replace earlier conversation instructions): {}", serde_json::to_string(&self.agent.instructions).unwrap()));
@@ -1973,7 +1976,8 @@ mod tests {
             assert!(r.prompt().contains("Tools are enabled"));
             assert!(!r.prompt().contains("Do not use tools"));
             // Every chat agent learns how to deliver an artifact: Codex with show_artifact, Claude
-            // as a fence or on claude.ai when asked, others as a fence; background work never does.
+            // on claude.ai or as a fence without the tool, others as a fence; background work never
+            // does.
             let delivery = match provider {
                 "codex" => crate::artifacts::Delivery::Tool,
                 "claude" => crate::artifacts::Delivery::ClaudeAi,
@@ -1984,9 +1988,14 @@ mod tests {
             assert_eq!(r.prompt().contains("show_artifact"), provider == "codex");
             assert_eq!(
                 r.prompt()
-                    .contains("only when the user asks for an artifact there"),
+                    .contains("publish it with the Artifact tool right away"),
                 provider == "claude"
             );
+            assert_eq!(
+                r.prompt().contains("has no Artifact tool"),
+                provider == "claude"
+            );
+            assert!(!r.prompt().contains("only when the user asks"));
             // So do the tools that show files, singly and side by side.
             for guidance in [sent_files::GUIDANCE, sent_files::COMPARE_GUIDANCE] {
                 assert_eq!(r.prompt().contains(guidance), provider != "gemini");

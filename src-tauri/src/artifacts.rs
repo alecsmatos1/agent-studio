@@ -4,12 +4,15 @@ use tauri::Manager;
 /// How a Codex chat delivers an artifact: a page it writes to a file and shows with
 /// show_artifact, which previews it (`providers/artifact_tool.rs`).
 const TOOL: &str = "When a request calls for a page the user opens beside the chat, such as a document, report, explainer, diagram, dashboard, prototype or small tool, make it an artifact with the show_artifact tool: write the complete page to an .html file (an .svg file for a standalone drawing) in a temporary folder, outside the project unless the user wants it there, and call show_artifact with a stable id, a short title and the file's absolute path. Agent Studio shows it in your reply as a card that opens the page in a sandboxed viewer, and the result returns screenshots of the page at the viewer's widths in light and dark themes with the problems found. Fix what they show in the file and call show_artifact again with the same id until the page looks finished, then place <!-- artifact:ID --> on its own line between blank lines in your final answer, where the page belongs, introduced in a sentence or two; never paste its source or a fenced copy. Use visualize for a visual that sits among your explanation instead. Do not create an artifact unless it serves the user's request.";
-/// How any other chat agent delivers one: a named html or svg fence, which the window shows as a
-/// card that opens it (`src/lib/artifacts.ts`).
-const FENCE: &str = "When a request calls for a page the user opens beside the chat, such as a document, report, explainer, diagram, dashboard, prototype or small tool, deliver it as an artifact: one fenced html block (svg for a standalone drawing) holding the complete page, its opening fence naming it after the language, as in ```html Release dashboard. Agent Studio shows that block as a card that opens the page in a sandboxed viewer, never as code, so introduce it in a sentence or two rather than repeating or summarizing its source. Do not create an artifact unless it serves the user's request.";
-/// What a Claude chat adds (requested 2026-10-21): Claude Code's own Artifact tools publish to
-/// claude.ai, only when the user asks (`providers/published_artifacts.rs`).
-const CLAUDE_AI: &str = "The Artifact tools publish to claude.ai: use them only when the user asks for an artifact there, such as to publish a page on claude.ai, update or open one there, or read its comments, and never publish on your own initiative; any other page is a fenced block as above. Agent Studio shows each artifact you publish or open as a card that opens it on claude.ai, so name it in a sentence with its link rather than describing the page again.";
+/// A page in a named html or svg fence, which the window shows as a card that opens it
+/// (`src/lib/artifacts.ts`).
+const FENCE: &str = "one fenced html block (svg for a standalone drawing) holding the complete page, its opening fence naming it after the language, as in ```html Release dashboard. Agent Studio shows that block as a card that opens the page in a sandboxed viewer, never as code, so introduce it in a sentence or two rather than repeating or summarizing its source.";
+/// How a Claude chat delivers a page (requested 2026-11-03: "the agents are preferring to make
+/// modifications locally instead of publishing the artifact right away and making modifications
+/// on top of it, it should be the default behavior (that's what happens in claude code desktop)";
+/// from 2026-10-21 they published only when asked): with Claude Code's own Artifact tools
+/// (`providers/published_artifacts.rs`), whose description already says the same.
+const PUBLISH_PAGES: &str = "Pages go on claude.ai by default, unless the user asks otherwise. When a request calls for a page the user opens beside the chat, such as a document, report, explainer, diagram, dashboard, prototype or small tool, publish it with the Artifact tool right away, as that tool's description says, without waiting to be asked or offering first: it stays private to the user until they share it, so internal work material is no reason to hold back. What that description keeps off claude.ai stays a file. Then keep working on top of it: every change to the page goes to the same artifact in the reply that makes the change, by publishing its file again, or with its url when that file is gone or another session published it, so its link always shows the latest version. Never leave a change only in a local file or a fenced copy; a page this conversation already delivered that way moves to an artifact the next time it changes. Agent Studio shows each artifact you publish or open as a card that opens it beside the chat, so name it in a sentence with its link rather than describing the page again. Do not create an artifact unless it serves the user's request.";
 
 /// How a chat agent delivers an artifact.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -18,7 +21,7 @@ pub enum Delivery {
     Tool,
     /// A named fence, for agents without Agent Studio's tools.
     Fence,
-    /// A named fence, or Claude Code's own Artifact tools when the user asks for claude.ai.
+    /// Claude Code's own Artifact tools (`PUBLISH_PAGES`), or a named fence without them.
     ClaudeAi,
 }
 /// What makes a page good in the sandboxed viewer that renders it (the constant
@@ -29,9 +32,17 @@ const PAGE_RULES: &str = "Make it a finished, polished page. Libraries and fonts
 pub fn guidance(delivery: Delivery) -> String {
     match delivery {
         Delivery::Tool => format!("{TOOL} {PAGE_RULES}"),
-        Delivery::Fence => format!("{FENCE} {PAGE_RULES}"),
-        Delivery::ClaudeAi => format!("{FENCE} {CLAUDE_AI} {PAGE_RULES}"),
+        Delivery::Fence => format!("When a request calls for a page the user opens beside the chat, such as a document, report, explainer, diagram, dashboard, prototype or small tool, deliver it as an artifact: {FENCE} Do not create an artifact unless it serves the user's request. {PAGE_RULES}"),
+        Delivery::ClaudeAi => format!("{PUBLISH_PAGES} Only when this conversation has no Artifact tool, or that tool refuses to publish here, deliver the page as an artifact of Agent Studio's instead: {FENCE} For a fenced page: {PAGE_RULES}"),
     }
+}
+
+/// What a Claude session that began under the earlier rule reads once, with its next reply's
+/// context (`Session::pages_rule_changed`). Its transcript says to publish only when asked, it
+/// never reads `guidance` again, and a system prompt cannot reach it: Claude Code 2.1.317 keeps
+/// the one a session started with and ignores `--append-system-prompt` on resume.
+pub fn pages_rule_changed() -> String {
+    format!("Agent Studio's rule for pages has changed, replacing what this conversation said earlier about publishing to claude.ai only when asked and about fenced blocks: {PUBLISH_PAGES}")
 }
 
 #[tauri::command]

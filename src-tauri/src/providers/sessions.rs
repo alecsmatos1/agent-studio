@@ -33,6 +33,16 @@ struct Record {
     received: bool,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     shared_context: String,
+    /// Whether its session has the current rule for pages, in its first message or the reply's
+    /// context. A binding written before 2026-11-03 has not, and its transcript says otherwise.
+    #[serde(default)]
+    pages_rule: bool,
+}
+impl Record {
+    /// Whether the session may still hold the earlier rule for pages.
+    fn before_pages_rule(&self) -> bool {
+        !self.received || !self.pages_rule
+    }
 }
 
 #[derive(Clone)]
@@ -49,6 +59,9 @@ pub struct Session {
     /// A rewind or file Undo replaced the history since the binding was written.
     pub history_rewritten: bool,
     pub instructions_changed: bool,
+    /// The session began under the earlier rule for pages, so this reply's context carries the
+    /// current one (`artifacts::pages_rule_changed`), once.
+    pub pages_rule_changed: bool,
     pub shared_context_changed: bool,
     pub unconfirmed_message: Option<usize>,
     transfer_from: Option<Record>,
@@ -393,6 +406,7 @@ impl Session {
                 instructions: String::new(),
                 received: true,
                 shared_context: String::new(),
+                pages_rule: true,
             })
         });
         let shared_context_changed = previous
@@ -417,6 +431,7 @@ impl Session {
             instructions_changed: previous
                 .as_ref()
                 .is_some_and(|p| !p.received || p.instructions != instructions),
+            pages_rule_changed: previous.as_ref().is_some_and(Record::before_pages_rule),
             unconfirmed_message: previous
                 .as_ref()
                 .filter(|p| !p.received)
@@ -434,6 +449,7 @@ impl Session {
                 instructions,
                 received: false,
                 shared_context,
+                pages_rule: true,
             },
         }))
     }
@@ -511,6 +527,7 @@ impl Session {
             self.record.id = previous.id.clone();
             self.resumed = true;
             self.instructions_changed = true;
+            self.pages_rule_changed = previous.before_pages_rule();
             self.unconfirmed_message = (!previous.received).then_some(previous.history.len() - 1);
             return Ok(());
         }
@@ -536,6 +553,7 @@ impl Session {
         self.resumed = true;
         // Refresh conversation instructions while leaving provider-native history intact.
         self.instructions_changed = true;
+        self.pages_rule_changed = previous.before_pages_rule();
         self.unconfirmed_message = (!previous.received).then_some(previous.history.len() - 1);
         Ok(())
     }
@@ -644,6 +662,7 @@ impl Session {
         self.resumed = false;
         self.transcript_missing = true;
         self.instructions_changed = false;
+        self.pages_rule_changed = false;
         self.shared_context_changed = false;
         self.unconfirmed_message = None;
         self.record.id = uuid::Uuid::new_v4().to_string();
@@ -2000,6 +2019,69 @@ mod tests {
         assert!(back.switched_account);
         assert_ne!(back.id(), switched_id);
     }
+    #[test]
+    fn a_session_begun_under_the_earlier_rule_for_pages_reads_the_current_one_once() {
+        let root = tempfile::tempdir().unwrap();
+        let mut r = request();
+        let note = crate::artifacts::pages_rule_changed();
+        r.native_session = Session::prepare(root.path(), &r).unwrap();
+        // A new session reads the rule with its first message, and is never told again.
+        assert!(r
+            .stdin_payload()
+            .contains("publish it with the Artifact tool right away"));
+        assert!(!r.stdin_payload().contains(&note));
+        let s = r.native_session.take().unwrap();
+        assert!(!s.pages_rule_changed);
+        s.bind(s.id(), true).unwrap();
+        let binding = s.path.clone();
+        drop(s);
+        r.messages
+            .extend([message("assistant", "Answer"), message("user", "Next")]);
+        r.native_session = Session::prepare(root.path(), &r).unwrap();
+        assert!(!r.native_session.as_ref().unwrap().pages_rule_changed);
+        assert_eq!(r.stdin_payload().lines().count(), 1);
+        r.native_session = None;
+        // A binding as earlier releases wrote it says nothing of the rule.
+        let mut record: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&binding).unwrap()).unwrap();
+        assert_eq!(record["pages_rule"], true);
+        record.as_object_mut().unwrap().remove("pages_rule");
+        std::fs::write(&binding, serde_json::to_vec(&record).unwrap()).unwrap();
+        r.native_session = Session::prepare(root.path(), &r).unwrap();
+        let payload = r.stdin_payload();
+        let lines: Vec<serde_json::Value> = payload
+            .lines()
+            .map(|s| serde_json::from_str(s).unwrap())
+            .collect();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0]["shouldQuery"], false);
+        assert!(lines[0].get("origin").is_none());
+        assert_eq!(lines[0]["message"]["content"][0]["text"], note.as_str());
+        assert_eq!(lines[1]["origin"]["kind"], "human");
+        // Only the note: it brings back no history.
+        assert!(!payload.contains("Answer"));
+        // Another agent's session never hears of it, and the binding remembers either way.
+        r.agent.provider = "codex".into();
+        assert!(r.native_context().is_none());
+        r.agent.provider = "claude".into();
+        // Told once, it is told no more.
+        let s = r.native_session.take().unwrap();
+        s.bind(s.id(), true).unwrap();
+        assert!(saved(&s).pages_rule);
+        drop(s);
+        r.messages
+            .extend([message("assistant", "Answer"), message("user", "Again")]);
+        r.native_session = Session::prepare(root.path(), &r).unwrap();
+        assert!(!r.native_session.as_ref().unwrap().pages_rule_changed);
+        assert_eq!(r.stdin_payload().lines().count(), 1);
+        // A message that never arrived may have carried it, so the next reply carries it again.
+        let s = r.native_session.take().unwrap();
+        s.bind(s.id(), false).unwrap();
+        drop(s);
+        r.native_session = Session::prepare(root.path(), &r).unwrap();
+        assert!(r.native_session.as_ref().unwrap().pages_rule_changed);
+    }
+
     #[test]
     fn claude_bootstraps_once_and_changes_instructions_without_replaying_history() {
         let root = tempfile::tempdir().unwrap();
