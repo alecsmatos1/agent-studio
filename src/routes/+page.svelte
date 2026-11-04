@@ -3,6 +3,9 @@
   import RewindDialog from '$lib/components/RewindDialog.svelte';
   import ImportChats from '$lib/components/ImportChats.svelte';
   import UndoFilesDialog from '$lib/components/UndoFilesDialog.svelte';
+  import ShutdownCountdown from '$lib/components/ShutdownCountdown.svelte';
+  import { ShutdownWatch } from '$lib/shutdown-watch.svelte';
+  import { unfinishedChats, waitingText, type Waiting } from '$lib/shutdown-watch';
   import {
     returnedDraft,
     rewindConversation,
@@ -36,6 +39,7 @@
     recordWindowStall,
     recordIpcFallback,
     workingForOthers,
+    chatsRunningForOthers,
     type AppUpdateStatus,
     type CliUpdates,
   } from '$lib/transport';
@@ -62,6 +66,7 @@
     Brain,
     Plug,
     Settings,
+    Power,
     Search,
     ChevronRight,
     SlidersHorizontal,
@@ -3465,6 +3470,7 @@
     return () => {
       disposed = true;
       workflows.stop();
+      shutdown.stop();
       stopAccountUpdates();
       stopBackgroundWork();
       stopUsageRefresh();
@@ -3805,6 +3811,47 @@
       restartingForUpdate = false;
     }
   }
+  /**
+   * Shut down when chats finish (src/lib/shutdown-watch.ts): the work this computer has left. Its
+   * replies, those this window is starting here and those it runs for other devices, the messages
+   * queued behind a running reply, the chats it goes on with after a usage limit, and the workflow
+   * runs it drives.
+   */
+  function shutdownWork(running: readonly string[]): Waiting {
+    const starting = Object.entries(runs).flatMap(([id, runId]) => {
+      const conversation = workspace.conversations.find((c) => c.id === id);
+      const reply = conversation?.messages.findLast((m) => m.runId === runId);
+      return runsHere(reply?.settings?.connectionId ?? conversation?.settings.connectionId)
+        ? [id]
+        : [];
+    });
+    const chats = unfinishedChats(workspace.conversations, {
+      running: [...running, ...starting, ...chatsRunningForOthers()],
+      queued,
+      replying: conversationRunning,
+      // A chat whose account cannot answer, such as one signed out, never goes on by itself.
+      continuesHere: (c) => drivesContinue(c) && readyToSend(c),
+    });
+    return { chats: chats.size, workflows: workflows.drivenRuns() };
+  }
+  /** What the computer keeps before it turns off: drafts and chats, published as they stand. */
+  async function beforeShutdown() {
+    await saveDraftsNow();
+    await flushWorkspace();
+    if (paired) await within(syncNow(true), 15_000);
+  }
+  const shutdown = new ShutdownWatch(shutdownWork, beforeShutdown, (message) => (notice = message));
+  const shutdownTitle = $derived.by(() => {
+    const waiting = shutdown.state.phase === 'watching' ? waitingText(shutdown.waiting) : '';
+    return waiting ? `Shut down when chats finish · ${waiting}` : 'Shut down when chats finish';
+  });
+  function toggleShutdown() {
+    void shutdown.toggle().catch((e) => (notice = String(e).replace(/^Error: /, '')));
+  }
+  // A watch left on before the window reloaded goes on once the chats are read.
+  $effect(() => {
+    if (loaded && desktop() && !installation?.server) untrack(() => void shutdown.start());
+  });
   function openRewind(messageId?: string) {
     if (!active?.messages.some((m) => m.role === 'user')) {
       historyError = 'There are no messages to rewind.';
@@ -7690,6 +7737,13 @@
           sidebarOpen = false;
         }}><Settings size={17} aria-hidden="true" /></button
       >
+      {#if desktop() && installation && !installation.server}<button
+          class="icon-button shutdown-toggle"
+          aria-label="Shut down when chats finish"
+          aria-pressed={shutdown.on}
+          title={shutdownTitle}
+          onclick={toggleShutdown}><Power size={17} aria-hidden="true" /></button
+        >{/if}
       {#if !desktop()}<BrowserStatus showConnection={false} compactInstall />{/if}
     </div>
     <SidebarResize onresize={(width) => (sidebarWidth = width)} />
@@ -8824,4 +8878,8 @@
       </footer>
     </div>
   </div>{/if}
+  {#if shutdown.state.phase === 'counting' || shutdown.state.phase === 'shutting'}<ShutdownCountdown
+      watch={shutdown}
+      onerror={(message) => (notice = message)}
+    />{/if}
 {/if}

@@ -66,6 +66,8 @@ enum Kind {
     Error,
     Cancelled,
     Test,
+    // Shut down when chats finish began its countdown (shutdown.rs), which the window shows.
+    Shutdown,
 }
 impl Notice {
     fn validate(&self) -> Result<(), String> {
@@ -82,9 +84,15 @@ impl Notice {
                             .all(|b| b.is_ascii_alphanumeric() || b == b'-')
                 })
                 && self.conversation_id.is_none()
-                && self.kind != Kind::Test
-        } else if self.kind == Kind::Test {
-            id == "test"
+                && !matches!(self.kind, Kind::Test | Kind::Shutdown)
+        } else if matches!(self.kind, Kind::Test | Kind::Shutdown) {
+            // A notice of the app's own, with its own text.
+            let name = if self.kind == Kind::Test {
+                "test"
+            } else {
+                "shutdown"
+            };
+            id == name
                 && uuid::Uuid::parse_str(event).is_ok()
                 && self.conversation_id.is_none()
                 && self.title.is_none()
@@ -133,6 +141,8 @@ impl Notice {
                 "Notifications are ready",
                 "Agent Studio can notify you when work finishes or needs your attention.",
             ),
+            // The countdown is a minute (`countdownMs` in src/lib/shutdown-watch.ts).
+            Kind::Shutdown => ("Shutting down in 1 minute", "All chats finished."),
         };
         let text = |value: &Option<String>, limit, fallback: &str| {
             value
@@ -350,6 +360,8 @@ fn show(app: &tauri::AppHandle, notice: &Notice) -> Result<(), String> {
             notification.action("default", "Open workflow");
         } else if notice.conversation_id.is_some() {
             notification.action("default", "Open chat");
+        } else if notice.kind == Kind::Shutdown {
+            notification.action("default", "Open Agent Studio");
         }
         let handle = notification.show().map_err(|_| "Could not send a desktop notification. Check your system notification settings and try the test again.")?;
         // Every banner keeps a listener for its click. Some Linux notification servers never
@@ -470,6 +482,40 @@ mod tests {
         n.tag = format!("{}:workflow:a1b2", uuid::Uuid::new_v4());
         assert!(n.validate().is_err());
         n.tag = format!("{id}:workflow:../x");
+        assert!(n.validate().is_err());
+    }
+    #[test]
+    fn the_shutdown_countdown_alert_carries_only_its_own_text() {
+        let id = uuid::Uuid::new_v4().to_string();
+        let mut n = Notice {
+            kind: Kind::Shutdown,
+            conversation_id: None,
+            workflow_id: None,
+            tag: format!("shutdown:{id}"),
+            title: None,
+            body: None,
+        };
+        assert!(n.validate().is_ok());
+        assert_eq!(n.target(), None);
+        assert_eq!(
+            n.content(),
+            (
+                "Shutting down in 1 minute".to_owned(),
+                "All chats finished.".to_owned()
+            )
+        );
+        // Not a chat's alert, a test's or a workflow's.
+        n.tag = format!("test:{id}");
+        assert!(n.validate().is_err());
+        n.tag = format!("shutdown:{id}");
+        n.title = Some("Turn off".into());
+        assert!(n.validate().is_err());
+        n.title = None;
+        n.conversation_id = Some(id.clone());
+        assert!(n.validate().is_err());
+        n.conversation_id = None;
+        n.workflow_id = Some(id.clone());
+        n.tag = format!("{id}:workflow:a1b2");
         assert!(n.validate().is_err());
     }
     #[test]

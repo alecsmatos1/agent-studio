@@ -199,6 +199,24 @@ export async function mockDesktop(page: Page, mode = 'success') {
             }
             return behavior;
           }
+          // Shut down when chats finish (src-tauri/src/shutdown.rs). The watch outlives a reload, as
+          // in the app; a test lists the chats the app runs in `test-shutdown-running`, and each
+          // shutdown it asks for in `test-shutdowns`.
+          if (['shutdown_watch', 'set_shutdown_watch', 'shut_down_computer'].includes(command)) {
+            const running = JSON.parse(localStorage.getItem('test-shutdown-running') ?? '[]');
+            if (command === 'set_shutdown_watch')
+              localStorage.setItem('test-shutdown-armed', String(args.armed));
+            const armed = localStorage.getItem('test-shutdown-armed') === 'true';
+            if (command !== 'shut_down_computer') return { armed, running };
+            if (!armed) throw 'Shut down when chats finish is off.';
+            if (running.length) return 'running';
+            const error = localStorage.getItem('test-shutdown-error');
+            if (error) throw error;
+            const asked = Number(localStorage.getItem('test-shutdowns') ?? 0) + 1;
+            localStorage.setItem('test-shutdowns', String(asked));
+            localStorage.setItem('test-shutdown-armed', 'false');
+            return 'shuttingDown';
+          }
           // The native version deliberately differs from package.json's.
           if (command === 'plugin:app|version') return '0.2.0';
           if (command === 'save_artifact') {
@@ -260,6 +278,7 @@ export async function mockDesktop(page: Page, mode = 'success') {
               computerId: '22222222-2222-4222-8222-222222222222',
               name: 'Desktop',
               platform: 'windows',
+              ...(localStorage.getItem('test-server') ? { server: true } : {}),
             };
           if (command === 'discover_wsl')
             return {

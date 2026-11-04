@@ -334,6 +334,29 @@ export const windowBehavior = async (): Promise<WindowBehavior> =>
 /** Keeps Agent Studio running in the tray when its window closes, or quits on close. */
 export const setCloseToTray = async (enabled: boolean): Promise<WindowBehavior> =>
   windowBehaviorSchema.parse(await invoke('set_close_to_tray', { enabled }));
+// Shut down when chats finish (src/lib/shutdown-watch.ts, src-tauri/src/shutdown.rs).
+const shutdownStatusSchema = z.object({ armed: z.boolean(), running: z.array(z.string()) });
+export type ShutdownStatus = z.infer<typeof shutdownStatusSchema>;
+/** Whether this computer turns off once its chats finish, and the chats whose replies it runs. */
+export async function shutdownWatchStatus(): Promise<ShutdownStatus> {
+  if (!desktop()) return { armed: false, running: [] };
+  return shutdownStatusSchema.parse(await invoke('shutdown_watch'));
+}
+/** Turns the watch on or off; while it is on, the computer stays awake. */
+export async function setShutdownWatch(armed: boolean): Promise<ShutdownStatus> {
+  if (!desktop()) throw new Error('Only the desktop app turns its computer off.');
+  return shutdownStatusSchema.parse(await invoke('set_shutdown_watch', { armed }));
+}
+/** Turns this computer off, unless a reply began on it meanwhile (`running`). */
+export async function shutDownComputer(): Promise<'shuttingDown' | 'running'> {
+  if (!desktop()) throw new Error('Only the desktop app turns its computer off.');
+  return z.enum(['shuttingDown', 'running']).parse(await invoke('shut_down_computer'));
+}
+/** The desktop alert that the countdown began, for a reader in another app. */
+export const notifyShutdownSoon = (): Promise<void> =>
+  invoke('desktop_notification', {
+    notice: { kind: 'shutdown', tag: `shutdown:${crypto.randomUUID()}` },
+  });
 // An alert waiting for its question asks for another look once the wait is over, taken at
 // the workspace this window last saved.
 let noticeWorkspace: Pick<Workspace, 'conversations'> | undefined;
@@ -728,6 +751,12 @@ const ownRuns = new Set<string>();
 const jobsToResume = new Set<string>();
 /** Whether this computer is running work another device asked of it. */
 export const workingForOthers = () => workerRuns.size > 0;
+/** The chats whose replies this computer runs for other devices, until each is published. */
+export const chatsRunningForOthers = (): string[] =>
+  [...workerRuns.values()].flatMap((job) => {
+    const id = job.method === 'run' ? (job.args.request as RunRequest)?.conversationId : undefined;
+    return typeof id === 'string' ? [id] : [];
+  });
 // Optional reads never keep this device from disconnecting; late results are discarded.
 function workspaceNoticeRead(method: RelayJob['method'], args: Record<string, unknown>) {
   return (

@@ -46,6 +46,47 @@ and AppImage packages bring the library along. GNOME shows AppIndicator icons on
 extension, such as Ubuntu's AppIndicator support; without it, open Agent Studio again to show a
 hidden window.
 
+## Shut down when chats finish
+
+The power button beside Connections and Settings at the foot of the sidebar turns this computer
+off once its chats finish (requested 2026-11-03, to leave the computer working through the
+night). Click it to turn the watch on; it stays pressed, and its hover says what it waits for,
+such as Waiting for 2 chats and 1 workflow. Click it again to turn it off.
+
+- **What it waits for:** everything this computer would still do by itself. Replies running here:
+  the window's own, those another device or a workflow started here, and those still waiting for
+  background work or for an answer to a question. Messages queued behind a running reply, on any
+  computer, since this window sends them. Chats a usage limit stopped that go on here once it
+  resets, however far off that is, while their account can answer. Workflow runs this computer
+  drives. A reply running on another computer holds nothing
+  unless messages wait for it here, and neither do servers and monitors a reply left running,
+  screens' jobs, messages kept after a stopped or failed reply, or paused workflow runs.
+- **Staying awake:** while the watch is on, the computer does not sleep, though the display may
+  turn off. Windows' power plans put a computer without input to sleep after a while, however
+  busy its programs are, which would stop the chats it waits for.
+- **The countdown:** once nothing is left, the window counts down a minute, with Cancel and Shut
+  down now, and a desktop alert when the window is hidden or another app is in front. Work that
+  begins meanwhile ends the countdown, and the watch waits again. Cancel turns the watch off.
+- **Turning off:** the window saves drafts and chats and publishes them through the relay, the app
+  releases parked CLIs as Quit does (without installing a downloaded update) and stops screens'
+  jobs, then turns the computer off. It refuses while a reply runs here, and the watch then waits
+  for it. Apps still open close without saving, since an app asking about unsaved work would
+  otherwise keep the computer on all night. If the computer is still on two minutes later, the
+  window says so and the watch is off.
+- **Kept where:** the watch lives in the app's memory, so a reload of the window, or the window
+  rebuilt after WebView2 ended, takes it up again; every start of the app begins with it off. A
+  server host has no button, and the Viewer cannot turn a computer off.
+
+- **Windows** turns off with `shutdown.exe /s /f /t 0` and stays awake through
+  `SetThreadExecutionState` (`ES_SYSTEM_REQUIRED`).
+- **macOS** turns off with System Events' `shut down`, which needs permission to control System
+  Events once and which an app can cancel, and stays awake with `caffeinate -i -w <app>`.
+- **Linux** turns off with `systemctl --no-ask-password poweroff` and stays awake with
+  `systemd-inhibit --what=sleep`.
+
+Debug builds never turn the computer off: they record the request in `shutdown-dry-run.txt` in
+the app's data folder instead, so development and native QA follow the whole path safely.
+
 ## How it works
 
 - `src-tauri/src/tray.rs` owns the setting, the icon and its menu. The close request in
@@ -63,6 +104,13 @@ hidden window.
 - `tauri-plugin-single-instance` is the first plugin, so a second launch signals the running app
   and exits before it opens a window or reads saved data. The running app shows, restores and
   focuses its window.
+- Shut down when chats finish: `src/lib/shutdown-watch.ts` holds its rules (`unfinishedChats`,
+  `watchStep`), `src/lib/shutdown-watch.svelte.ts` looks at the work left every two seconds while
+  it waits and every second while it counts down, and `ShutdownCountdown.svelte` is the countdown.
+  `src-tauri/src/shutdown.rs` keeps the watch and the request that holds the computer awake,
+  reports the chats of the replies in the run registry (`shutdown_watch`), and turns the computer
+  off (`shut_down_computer`) after `release_for_shutdown` in `src-tauri/src/lib.rs`, which leaves
+  replies alone. The countdown's desktop alert is the `shutdown` notification kind.
 
 ## Development
 
@@ -88,3 +136,11 @@ tray icon first. Native QA identifiers such as `com.vinicius.agentstudio.tray-qa
   items with the menu's keyboard handling. `npm run start:windows -- -SecondInstance` launches a
   second copy and reports whether it handed over. Pass `--reply` for one real Claude reply that
   must finish while the window is hidden and leave its alert in Windows' notification history.
+- Shut down when chats finish: `src/lib/shutdown-watch.test.ts` (what holds the watch, its states
+  and the time left), `src-tauri/src/shutdown.rs` tests (running chats counted once, shutdown.exe's
+  exit codes, the reported shapes, the thread that keeps the computer awake) and the `shutdown`
+  notice in `src-tauri/src/notifications.rs`. `tests/shutdown-watch.spec.ts` follows the button
+  through a running reply, the countdown, Cancel, a reply that begins during the countdown, Shut
+  down now, a reload, a refused shutdown and a server host. `scripts/shutdown-native-smoke.mjs`
+  drives a debug build of `scripts/native-shutdown.tauri.json` (CDP 19893) through the same path
+  to its dry run, and checks that the computer is held awake whenever no other program holds it.

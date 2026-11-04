@@ -37,6 +37,7 @@ mod screens;
 mod sent;
 mod server;
 mod shared_context;
+mod shutdown;
 mod sign_in;
 mod site_icons;
 mod spend;
@@ -1829,6 +1830,14 @@ fn owned_tokens(app: &tauri::AppHandle) -> Vec<CancellationToken> {
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
+    tokens.extend(background_tokens(app));
+    tokens
+}
+
+/// The owned work beside replies and file Undos: titles, folder icons, usage reads, sign-ins and
+/// plugin evaluations.
+fn background_tokens(app: &tauri::AppHandle) -> Vec<CancellationToken> {
+    let mut tokens = Vec::new();
     tokens.extend(
         app.state::<titles::Titles>()
             .0
@@ -1881,6 +1890,27 @@ async fn release_owned_work(app: &tauri::AppHandle) {
     loop {
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
         if owned_tokens(app).is_empty() && !providers::ending() {
+            break;
+        }
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+}
+
+/// Releases owned work before this computer turns off (`shutdown.rs`) as `release_owned_work`
+/// does, except replies: none runs when it begins, and one that begins meanwhile is the caller's
+/// to wait for rather than stop.
+async fn release_for_shutdown(app: &tauri::AppHandle) {
+    for token in background_tokens(app) {
+        token.cancel();
+    }
+    app.state::<mcp::Management>().sweep(app, true).await;
+    let screens = app.state::<std::sync::Arc<screens::Screens>>();
+    screens.calls.shutdown().await;
+    screens.jobs.shutdown().await;
+    app.state::<pool::Pool>().shutdown().await;
+    loop {
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        if background_tokens(app).is_empty() && !providers::ending() {
             break;
         }
     }
@@ -1996,6 +2026,7 @@ pub fn run() {
         .manage(imports::Catalog::default())
         .manage(std::sync::Arc::new(screens::Screens::default()))
         .manage(sign_in::SignIns::default())
+        .manage(shutdown::Shutdown::default())
         .manage(watchdog::Watchdog::default())
         .manage(window_recovery::Recovery::default())
         .setup(|app| {
@@ -2200,6 +2231,9 @@ pub fn run() {
             export_workspace,
             tray::window_behavior,
             tray::set_close_to_tray,
+            shutdown::shutdown_watch,
+            shutdown::set_shutdown_watch,
+            shutdown::shut_down_computer,
             watchdog::window_heartbeat,
             watchdog::record_window_stall,
             watchdog::record_ipc_fallback

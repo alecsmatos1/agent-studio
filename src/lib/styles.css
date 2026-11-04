@@ -1372,6 +1372,15 @@ pre {
   background: var(--accent-soft-hover);
   color: var(--accent-hover);
 }
+/* So does the sidebar's Shut down when chats finish while it watches. */
+.shutdown-toggle[aria-pressed='true'] {
+  background: var(--accent-soft);
+  color: var(--accent-text);
+}
+.shutdown-toggle[aria-pressed='true']:not(:disabled):hover {
+  background: var(--accent-soft-hover);
+  color: var(--accent-hover);
+}
 .main-area {
   min-width: 0;
   display: flex;

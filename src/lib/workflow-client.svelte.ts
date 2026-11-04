@@ -210,6 +210,12 @@ export class WorkflowClient {
   driving(id: string) {
     return this.drivers.has(id);
   }
+  /** The runs this page drives that go on by themselves, paused ones aside. */
+  drivenRuns() {
+    let count = 0;
+    for (const { driver } of this.drivers.values()) if (driver.run.status === 'running') count++;
+    return count;
+  }
 
   start() {
     void this.chooseMode();
