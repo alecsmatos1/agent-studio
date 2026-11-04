@@ -362,7 +362,7 @@ test('sending while reading above the end of a chat leaves the reading position 
 });
 
 for (const by of ['wheel', 'elsewhere'] as const)
-  test(`${by === 'wheel' ? "the reader's wheel" : 'a scroll from elsewhere, such as find in page,'} ends a glide where it is`, async ({
+  test(`${by === 'wheel' ? "the reader's wheel" : 'a scroll from elsewhere, such as find in page,'} ends a glide where it is @webkit`, async ({
     page,
   }) => {
     const { composer, second, scroll } = await finishedChat(page);
@@ -394,6 +394,48 @@ for (const by of ['wheel', 'elsewhere'] as const)
     expect(Math.abs((await top()) - reading)).toBeLessThan(2);
     await expect(page.getByRole('button', { name: 'Jump to latest', exact: true })).toBeVisible();
   });
+
+test('a position the content moves under a glide keeps the chat following @webkit', async ({
+  page,
+}) => {
+  const { composer, second, scroll } = await finishedChat(page);
+  await composer.fill(paragraphs('Question', 30));
+  await expect.poll(() => fromEnd(page)).toBeLessThan(2);
+  const start = await scroll.evaluate((el) => el.scrollTop);
+  // What a reply ending this soon does, in a frame of the glide close to its end: the
+  // conversation is shorter for a moment as its activity folds, which pulls the position up with
+  // it, and then taller than it was with the reply's footer.
+  const moved = page.evaluate(
+    (start) =>
+      new Promise<number>((resolve) => {
+        const el = document.querySelector<HTMLElement>('.chat-scroll')!;
+        const watch = () => {
+          const gap = el.scrollHeight - el.clientHeight - el.scrollTop;
+          if (el.scrollTop <= start || gap > 120) return requestAnimationFrame(watch);
+          const [sent] = [...el.querySelectorAll<HTMLElement>('[data-testid="message"]')].slice(-2);
+          const before = el.scrollTop;
+          sent.style.overflow = 'hidden';
+          sent.style.height = `${sent.getBoundingClientRect().height - gap - 4}px`;
+          // Reading the position lays out the shorter conversation, which clamps it.
+          resolve(before - el.scrollTop);
+          sent.style.overflow = '';
+          sent.style.height = '';
+          sent.style.marginBottom = '70px';
+        };
+        watch();
+      }),
+    start,
+  );
+  await composer.press('Enter');
+  expect(await moved).toBeGreaterThan(2);
+  await expect.poll(() => fromEnd(page)).toBeLessThan(2);
+  await expect(page.getByRole('button', { name: 'Jump to latest', exact: true })).toBeHidden();
+  // Following goes on once the glide has ended.
+  const run = await second();
+  await emit(page, run.runId, { kind: 'text', text: paragraphs('Reply', 20) });
+  await expect(page.getByText('Reply paragraph 20.', { exact: true })).toBeInViewport();
+  await expect.poll(() => fromEnd(page)).toBeLessThan(2);
+});
 
 test('a chat whose last reply holds a visualization opens at its end once the visual sizes itself', async ({
   page,

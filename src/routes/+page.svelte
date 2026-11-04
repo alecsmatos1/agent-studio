@@ -965,7 +965,7 @@
     holdPlace(undefined);
     if (glide) {
       // The glide's own scrolling keeps the chat following; any other scroll ends it here.
-      if (!glide.frame || Math.abs((chatScroll?.scrollTop ?? 0) - glide.top) < 1) return;
+      if (!glide.frame || !chatScroll || !scrolledElsewhere(glide, chatScroll)) return;
       stopGlide();
     }
     const hold = virtualSpace?.scrolled() ?? 'free';
@@ -993,8 +993,22 @@
   // scrolling to it, and the reader's own wheel, pointer or keys, or any scroll the glide did
   // not make, end it where it is.
   let glide:
-    | { conversation: string; frame: number; at: number; start: number; top: number }
+    | {
+        conversation: string;
+        frame: number;
+        at: number;
+        start: number;
+        top: number;
+        range: number;
+      }
     | undefined;
+  const scrollRange = (scroll: HTMLElement) => scroll.scrollHeight - scroll.clientHeight;
+  // Whether something else scrolled the chat, as find in page does. Content that changes height
+  // moves the position by itself: a reply ending during the glide makes the conversation shorter
+  // for a moment, which pulls the position up with it, and that is no scroll of the reader's.
+  function scrolledElsewhere(current: NonNullable<typeof glide>, scroll: HTMLElement) {
+    return Math.abs(scroll.scrollTop - current.top) >= 1 && scrollRange(scroll) === current.range;
+  }
   const reducedMotion = () =>
     typeof matchMedia === 'function' && matchMedia('(prefers-reduced-motion: reduce)').matches;
   function stickToEnd(scroll: HTMLElement) {
@@ -1006,6 +1020,7 @@
     if (glide?.conversation !== conversation || glide.frame || !chatScroll) return;
     glide.at = glide.start = performance.now();
     glide.top = chatScroll.scrollTop;
+    glide.range = scrollRange(chatScroll);
     glide.frame = requestAnimationFrame(glideFrame);
   }
   function glideFrame(now: number) {
@@ -1016,11 +1031,12 @@
       glide = undefined;
       return;
     }
-    if (Math.abs(scroll.scrollTop - current.top) >= 1) {
+    if (scrolledElsewhere(current, scroll)) {
       takeOver();
       return;
     }
-    const gap = scroll.scrollHeight - scroll.clientHeight - scroll.scrollTop;
+    const range = scrollRange(scroll);
+    const gap = range - scroll.scrollTop;
     // Output that keeps arriving cannot hold the glide open; following takes over from it.
     if (gap < 1 || now - current.start > 700) {
       glide = undefined;
@@ -1032,6 +1048,7 @@
     // At least a pixel a frame, so rounding cannot stall the last few.
     scroll.scrollTop += Math.max(gap * share, Math.min(gap, 1));
     current.top = scroll.scrollTop;
+    current.range = range;
     current.frame = requestAnimationFrame(glideFrame);
   }
   function stopGlide() {
@@ -6178,7 +6195,7 @@
     if (glides) {
       // Armed before the message renders, so nothing jumps to it first.
       stopGlide();
-      glide = { conversation: conversation.id, frame: 0, at: 0, start: 0, top: 0 };
+      glide = { conversation: conversation.id, frame: 0, at: 0, start: 0, top: 0, range: 0 };
       void tick().then(() => startGlide(conversation.id));
     }
     if (conversation.archived) {
