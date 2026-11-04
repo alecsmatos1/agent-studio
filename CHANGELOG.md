@@ -5,6 +5,41 @@ each GitHub release uses its section as release notes. `npm run release:version`
 version's section from the commit subjects since the previous release; edit it before committing.
 See [automatic updates](docs/UPDATES.md#publishing-a-release).
 
+## 1.2.0 - 2026-11-04
+
+### Added
+
+- Turn the computer off once its chats finish: a power button beside Connections and Settings
+  keeps it awake while it waits for this computer's replies, queued messages, chats going on
+  after a usage limit and workflow runs, then counts down one minute with Cancel and Shut down
+  now. Shutting down closes other apps without saving
+- Pin chats: Pin in the chat toolbar or in a sidebar row's menu keeps a chat at the top of the
+  Active or History tab it is in, on all your devices
+- Bring chats back where you left them: a chat shown again after another chat or page returns to
+  what you were reading, or to its end if you were following it, with what you opened in it
+  still open. An artifact beside its chat keeps its tab and scroll positions, and a sub-agent's
+  conversation its place
+
+### Changed
+
+- Publish Claude chats' pages to claude.ai right away, without waiting to be asked, and make
+  later changes on top of the same artifact. Artifacts start private, and a page you ask to keep
+  off claude.ai stays a file
+
+### Fixed
+
+- Keep Agent Studio's guidance in a Claude chat after its context is compacted: such a chat
+  forgot how to show files, visuals, questions and pages, and listed its pictures' paths instead
+  of showing them
+- Show only the limits an account reports: a 5-hour or Weekly bar no longer reads Not reported
+  on plans without that limit, in the composer, the Agent picker and Connections. Before an
+  account's first reading they show Checking…
+- Stop asking to turn off a plan mode that was never on: when Claude Code's safety checks refuse
+  a command, such as `rm` on a variable path, the agent now hears what it hears in Claude's
+  desktop app, and of plan mode only in plan mode
+- Load a claude.ai artifact again beside the chat when a later reply changes it
+- Give a page made from an Artifact type its card, and open it beside the chat
+
 ## 1.1.1 - 2026-10-31
 
 ### Changed
