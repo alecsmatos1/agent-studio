@@ -1,5 +1,12 @@
+import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
-import { conversationSchema, historyFor, type Conversation } from './domain';
+import {
+  conversationSchema,
+  filesUndoneMark,
+  historyFor,
+  lastReplyOf,
+  type Conversation,
+} from './domain';
 import type { DraftContent } from './drafts';
 import type { DraftImage } from './images';
 import type { QueuedMessage } from './queue';
@@ -57,6 +64,33 @@ const noDraft = (): DraftContent => ({
   mentionScope: 'scope',
 });
 describe('rewinding saved conversations', () => {
+  it('names the reply a message follows, which a native session continues after', () => {
+    const original = chat();
+    const [first, second] = [original.messages[1], original.messages[3]];
+    expect(lastReplyOf(original)).toEqual({ runId: second.runId });
+    // After a rewind, it is the last reply the chat kept.
+    const rewound = rewindConversation(original, original.messages[2].id);
+    expect(lastReplyOf(rewound)).toEqual({ runId: first.runId });
+    // A rewind to the first message leaves no reply to continue after.
+    expect(lastReplyOf(rewindConversation(original, original.messages[0].id))).toBeUndefined();
+    // Its steering are messages of that reply, not the next one.
+    second.steering = [{ id: crypto.randomUUID(), runId: second.runId!, sequence: 1, text: 'Hm' }];
+    expect(lastReplyOf(original)).toEqual({
+      runId: second.runId,
+      steering: [second.steering[0].id],
+    });
+    // A reply without a run, as older imports have, names nothing.
+    delete second.runId;
+    delete second.steering;
+    expect(lastReplyOf(original)).toEqual({ runId: first.runId });
+  });
+  it('marks an undone reply in the words the host recognizes', () => {
+    const original = chat();
+    original.messages[1].filesUndone = true;
+    expect(historyFor(original)[1].text).toBe(`First answer${filesUndoneMark}`);
+    const host = readFileSync('src-tauri/src/providers/sessions.rs', 'utf8');
+    expect(host).toContain(JSON.stringify(filesUndoneMark));
+  });
   it('forks only retained messages and leaves the source rewind independently recoverable', () => {
     const original = chat();
     const rewound = rewindConversation(original, original.messages[2].id);

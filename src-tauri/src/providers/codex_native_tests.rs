@@ -402,3 +402,204 @@ async fn installed_codex_answers_workflow_tools_through_the_window() {
     assert!(answer.contains("Probe mission"), "{answer}");
     eprintln!("Tools {tools:?}; answer: {answer}");
 }
+
+/// A rewound Codex chat and a new fork go on with what their thread held through the reply they
+/// follow: output only a command returned, deleted since, none of what came later, also from
+/// before a compaction; and Agent Studio's tools stay theirs.
+#[tokio::test]
+#[ignore = "Opt-in installed Codex CLI test; uses subscription capacity and a model's tool choice."]
+async fn installed_codex_rewinds_and_forks_keep_their_native_context() {
+    const CODEWORD: &str = "MARIGOLD-7741";
+    const ASK: &str = "Run no command. On one line: what word did notes.txt print earlier, what fruit and what vegetable did I ask you to remember? Say none for what you have no record of.";
+    let folder = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let runtime = root.path().join("chat-runtime");
+    std::fs::create_dir_all(&runtime).unwrap();
+    let notes = folder.path().join("notes.txt");
+    std::fs::write(&notes, format!("Today's word is {CODEWORD}.\n")).unwrap();
+    let cwd = folder.path().to_string_lossy().into_owned();
+    let exe = crate::providers::resolve("codex").await.unwrap();
+    let (computer, environment) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+    let location = json!({"computerId":computer,"environmentId":environment,"path":cwd});
+    let conversation = uuid::Uuid::new_v4().to_string();
+    let request = |run: &str, revision: u64, messages: &serde_json::Value| -> RunRequest {
+        serde_json::from_value(json!({"runId":run,"conversationId":conversation,
+            "historyRevision":revision,"location":location,
+            "agent":{"provider":"codex","model":"gpt-5.6-luna","reasoning":"low","instructions":""},
+            "messages":messages}))
+        .unwrap()
+    };
+    let prepare = |mut request: RunRequest| {
+        let (root, cwd) = (root.path().to_path_buf(), cwd.clone());
+        async move {
+            let mut session = crate::providers::sessions::Session::prepare(&root, &request)
+                .unwrap()
+                .unwrap();
+            session.fork_here(&request).await;
+            session.set_fork_folder(Some(cwd));
+            request.native_session = Some(session);
+            request
+        }
+    };
+    let reply = |request: RunRequest| {
+        let (exe, runtime, cwd) = (exe.clone(), runtime.clone(), cwd.clone());
+        async move {
+            let mut command = crate::providers::chat_command(&request, &runtime, &exe)
+                .await
+                .unwrap();
+            let mut process = Process::new(
+                exe,
+                command.spawn().unwrap(),
+                "rewind".into(),
+                String::new(),
+            )
+            .unwrap();
+            let (tx, _received) = tokio::sync::mpsc::unbounded_channel();
+            let channel = EventSink::new(move |event| {
+                let _ = tx.send(event);
+                Ok(())
+            });
+            let mut questions = Questions::default()
+                .open(&request.run_id, None, channel.clone())
+                .unwrap();
+            let result = tokio::time::timeout(
+                Duration::from_secs(300),
+                run(
+                    &mut process,
+                    &request,
+                    Some(&channel),
+                    CancellationToken::new(),
+                    &mut questions,
+                    Some(&cwd),
+                    false,
+                ),
+            )
+            .await
+            .expect("Installed CLI test timed out");
+            let (status, text) = result.expect("Installed CLI failed");
+            assert_eq!(status, "complete", "{text}");
+            (text, process)
+        }
+    };
+    let say = |role: &str, text: &str| json!({"role":role,"text":text});
+    let new_run = || uuid::Uuid::new_v4().to_string();
+    let bound = |conversation: &str| -> String {
+        let bytes = std::fs::read(
+            root.path()
+                .join("native-sessions")
+                .join(format!("{conversation}.json")),
+        )
+        .unwrap();
+        serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    let mut threads = Vec::new();
+
+    let read_it = "Run a command that prints notes.txt, then reply with only the word DONE.";
+    let run1 = new_run();
+    let mut messages = vec![say("user", read_it)];
+    let (first_answer, mut process) =
+        reply(prepare(request(&run1, 0, &json!(messages))).await).await;
+    process.kill().await;
+    std::fs::remove_file(&notes).unwrap();
+    let original = bound(&conversation);
+    threads.push(original.clone());
+    let profile = crate::context::native_profile_root("codex").await.unwrap();
+    let rollout = |thread: &str| -> String {
+        std::fs::read_to_string(
+            crate::native_instructions::find_record(&profile, "codex", thread)
+                .unwrap()
+                .expect("A saved rollout"),
+        )
+        .unwrap()
+    };
+    assert!(
+        rollout(&original).contains(CODEWORD),
+        "The command printed it"
+    );
+    messages.push(say("assistant", &first_answer));
+    let kept = messages.clone();
+    messages.push(say(
+        "user",
+        "Remember the fruit PAPAYA-2093. Reply only OK.",
+    ));
+    let (_, mut process) = reply(prepare(request(&new_run(), 0, &json!(messages))).await).await;
+    process.kill().await;
+    assert_eq!(bound(&conversation), original, "A follow-up resumes");
+
+    // Rewound to before the fruit, with a new question.
+    let mut messages = kept;
+    messages.push(say("user", ASK));
+    let mut rewound = request(&new_run(), 1, &json!(messages));
+    rewound.rewound = true;
+    rewound.last_reply = serde_json::from_value(json!({"runId":run1})).unwrap();
+    let rewound = prepare(rewound).await;
+    let session = rewound.native_session.as_ref().unwrap();
+    assert!(session.resumed && session.native_fork.is_some());
+    let ask_run = rewound.run_id.clone();
+    let (answer, mut process) = reply(rewound).await;
+    process.kill().await;
+    eprintln!("After the rewind: {answer}");
+    assert!(answer.contains(CODEWORD), "{answer}");
+    assert!(!answer.contains("PAPAYA-2093"), "{answer}");
+    let forked = bound(&conversation);
+    assert_ne!(forked, original, "The rewound chat has a thread of its own");
+    threads.push(forked.clone());
+
+    // A compaction and a later message, then a rewind to before the compaction.
+    messages.push(say("assistant", &answer));
+    let before_compaction = messages.clone();
+    messages.push(say("user", "/compact"));
+    let mut compact = request(&new_run(), 1, &json!(messages));
+    compact.compact = true;
+    let (_, mut process) = reply(prepare(compact).await).await;
+    process.kill().await;
+    messages.push(say("assistant", "Compacted"));
+    messages.push(say(
+        "user",
+        "Remember the vegetable OKRA-5512. Reply only OK.",
+    ));
+    let (_, mut process) = reply(prepare(request(&new_run(), 1, &json!(messages))).await).await;
+    process.kill().await;
+    assert_eq!(bound(&conversation), forked);
+    let mut messages = before_compaction;
+    messages.push(say("user", ASK));
+    let mut uncompacted = request(&new_run(), 2, &json!(messages));
+    uncompacted.rewound = true;
+    uncompacted.last_reply = serde_json::from_value(json!({"runId":ask_run})).unwrap();
+    let uncompacted = prepare(uncompacted).await;
+    let second_ask = uncompacted.run_id.clone();
+    let (answer, mut process) = reply(uncompacted).await;
+    process.kill().await;
+    eprintln!("From before the compaction: {answer}");
+    assert!(answer.contains(CODEWORD), "{answer}");
+    assert!(!answer.contains("OKRA-5512"), "{answer}");
+    threads.push(bound(&conversation));
+
+    // A fork of the chat keeps the codeword and Agent Studio's own tools.
+    messages.push(say("assistant", &answer));
+    let fork_id = uuid::Uuid::new_v4().to_string();
+    messages.push(say("user", "Run no command. On one line: what word did notes.txt print earlier, and is a tool named studio_ask_user available to you, yes or no?"));
+    let mut fork = request(&new_run(), 0, &json!(messages));
+    fork.conversation_id = Some(fork_id.clone());
+    fork.forked = true;
+    fork.forked_from = vec![conversation.clone()];
+    fork.last_reply = serde_json::from_value(json!({"runId":second_ask})).unwrap();
+    let fork = prepare(fork).await;
+    assert!(fork.native_session.as_ref().unwrap().native_fork.is_some());
+    let (answer, mut process) = reply(fork).await;
+    eprintln!("In the fork: {answer}");
+    assert!(answer.contains(CODEWORD), "{answer}");
+    assert!(answer.to_lowercase().contains("yes"), "{answer}");
+    threads.push(bound(&fork_id));
+
+    // Newest first, since a fork's history names the thread it came from.
+    for thread in threads.iter().rev() {
+        let deleted =
+            crate::plugins::rpc(&mut process, "thread/delete", json!({"threadId":thread})).await;
+        eprintln!("Deleted {thread}: {:?}", deleted.map(|_| "ok"));
+    }
+    process.kill().await;
+}

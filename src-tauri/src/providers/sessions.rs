@@ -13,6 +13,52 @@ use std::{
 pub(crate) const STALE_HISTORY: &str =
     "This conversation changed in another window or on another device. Wait for it to sync, then send again.";
 
+/// What a file Undo adds to a reply's saved text (`historyFor` in `src/lib/domain.ts`).
+pub(crate) const FILES_UNDONE_MARK: &str = "\n\n[The user undid this response’s recorded file edits after the response. Check the current files before continuing.]";
+/// The notes a session that kept its context reads once, in the words the Claude app uses.
+const FILES_UNDONE_NOTE: &str = "The user restored files to how they were at an earlier point in this conversation, without rewinding the conversation to that point. Edits described in messages after that point may no longer be on disk. Check git status or the diff before relying on them, and do not redo those edits unless the user asks.";
+const REWOUND_NOTE: &str = "The user rewound this conversation to an earlier point. Files on disk were not reverted, so edits from the discarded turns may still be present; check git status or the diff before assuming file contents.";
+const FORKED_NOTE: &str = "This session is a fork of another conversation, resumed at this point of its transcript. The working tree may not match what the transcript implies (it can hold changes made after this point, or lack uncommitted ones); check git status or the diff before assuming file contents.";
+const FORK_FOLDER_NOTE: &str = "This fork works in a new folder of its own. Paths in earlier messages and tool results may name the folder of the chat it was forked from, whose files are not here.";
+/// What the reply says when a rewind could not keep its session's context.
+pub(crate) const REWIND_REPLAYED: &str = "Starting a new native session from the retained messages after a rewind. Earlier tool details and compacted context are not carried over.";
+
+/// The reply a message follows, as its request names it. Its run id is the id of the user message
+/// that started it in a Claude transcript (`stdin_payload`).
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LastReply {
+    pub run_id: String,
+    /// The ids of its accepted steering, which are entries of their own in the transcript.
+    #[serde(default)]
+    pub steering: Vec<String>,
+}
+
+/// The Codex thread and turn that answered a reply, which a later fork goes through.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReplyTurn {
+    run: String,
+    thread: String,
+    turn: String,
+}
+
+/// The sessions a rewound chat or a new fork can continue from, and the reply it continues after.
+#[derive(Clone)]
+struct Cut {
+    sources: Vec<Record>,
+    reply: LastReply,
+    fork: bool,
+}
+
+/// The Codex thread and turn this reply's thread forks through.
+#[derive(Clone)]
+pub struct NativeFork {
+    pub thread: String,
+    pub turn: String,
+    pub cwd: Option<String>,
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Record {
@@ -37,11 +83,32 @@ struct Record {
     /// context. A binding written before 2026-11-03 has not, and its transcript says otherwise.
     #[serde(default)]
     pages_rule: bool,
+    /// The sessions this chat's history ran in before this one, nearest first. A fork of a
+    /// compacted Claude session leaves out what came before the compaction, which stays there.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    ancestors: Vec<String>,
+    /// Which Codex turn answered each reply.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    turns: Vec<ReplyTurn>,
+    /// The revision of a rewind whose message reads as a retry of what it discarded, until the
+    /// reply that sends it starts its session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    rewound_at: Option<u64>,
+    /// A file Undo happened since the session's last reply started. A stopped reply's edits can be
+    /// undone too, and no saved text tells of those.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    files_undone: bool,
 }
 impl Record {
     /// Whether the session may still hold the earlier rule for pages.
     fn before_pages_rule(&self) -> bool {
         !self.received || !self.pages_rule
+    }
+    /// This session and the ones before it, nearest first.
+    fn lineage(&self) -> Vec<String> {
+        std::iter::once(self.id.clone())
+            .chain(self.ancestors.iter().cloned())
+            .collect()
     }
 }
 
@@ -56,8 +123,14 @@ pub struct Session {
     /// The selected account differs from the bound one: fork its latest native history
     /// into the selected profile, preserving the source and the conversation's folder.
     pub switched_account: bool,
-    /// A rewind or file Undo replaced the history since the binding was written.
+    /// A rewind replaced the history since the binding was written, and this reply starts a new
+    /// session from the saved messages unless `prepare_transfer` forks the old one (`cut`).
     pub history_rewritten: bool,
+    /// Where this reply's session continues from, until `prepare_transfer` forks it.
+    cut: Option<Cut>,
+    pub native_fork: Option<NativeFork>,
+    /// What this reply's context tells a session that kept its context, once.
+    pub notes: Vec<&'static str>,
     pub instructions_changed: bool,
     /// The session began under the earlier rule for pages, so this reply's context carries the
     /// current one (`artifacts::pages_rule_changed`), once.
@@ -177,6 +250,66 @@ fn valid(record: &Record) -> bool {
         && (record.version == 1 || (!record.account.is_empty() && !record.location.is_empty()))
 }
 
+/// Whether a history holds all a session received. A file Undo only adds its mark to a reply the
+/// session already holds, so that reply still counts as received.
+fn holds_received(
+    received: &[String],
+    history: &[String],
+    messages: &[super::ChatMessage],
+) -> Result<bool, String> {
+    if history.len() < received.len() {
+        return Ok(false);
+    }
+    for (index, seen) in received.iter().enumerate() {
+        if &history[index] == seen {
+            continue;
+        }
+        if !messages[index].text.contains(FILES_UNDONE_MARK) {
+            return Ok(false);
+        }
+        let mut unmarked = messages[index].clone();
+        unmarked.text = unmarked.text.replacen(FILES_UNDONE_MARK, "", 1);
+        if &fingerprint(&unmarked)? != seen {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// The sessions of the chats a fork was copied from, nearest chat first, on this computer and in
+/// this folder. Conversation ids from a request only ever name a binding here.
+fn fork_sources(directory: &Path, request: &RunRequest, identity: &Identity) -> Vec<Record> {
+    request
+        .forked_from
+        .iter()
+        .filter_map(|id| {
+            let id = uuid::Uuid::parse_str(id).ok()?;
+            let bytes = std::fs::read(directory.join(format!("{id}.json"))).ok()?;
+            let record: Record = serde_json::from_slice(&bytes).ok()?;
+            (valid(&record) && (record.scope == identity.scope || other_account(&record, identity)))
+                .then_some(record)
+        })
+        .collect()
+}
+
+fn write_record(path: &Path, record: &Record) -> Result<(), String> {
+    let directory = path
+        .parent()
+        .ok_or("Cannot prepare native session binding")?;
+    let mut file = tempfile::NamedTempFile::new_in(directory)
+        .map_err(|_| "Cannot prepare native session binding")?;
+    file.write_all(
+        &serde_json::to_vec(record).map_err(|_| "Cannot encode native session binding")?,
+    )
+    .map_err(|_| "Cannot save native session binding")?;
+    file.as_file()
+        .sync_all()
+        .map_err(|_| "Cannot flush native session binding")?;
+    file.persist(path)
+        .map_err(|_| "Cannot replace native session binding")?;
+    Ok(())
+}
+
 /// A version 2 binding for the same computer and folder under another account.
 // A terminal login turned into a separate profile keeps its connection id while its earlier
 // native history stays in the terminal directory, so that directory is also a transfer source.
@@ -213,6 +346,23 @@ fn other_account(record: &Record, identity: &Identity) -> bool {
         && record.scope != identity.scope
         && record.location == identity.location
         && record.account != identity.account
+}
+
+/// Records a file Undo for the conversation's native session, whose next reply is told of it. A
+/// conversation without a session has nothing to tell.
+pub fn note_files_undone(root: &Path, conversation: &str) -> Result<(), String> {
+    let conversation =
+        uuid::Uuid::parse_str(conversation).map_err(|_| "Invalid conversation id")?;
+    let path = root
+        .join("native-sessions")
+        .join(format!("{conversation}.json"));
+    let Ok(bytes) = std::fs::read(&path) else {
+        return Ok(());
+    };
+    let mut record: Record =
+        serde_json::from_slice(&bytes).map_err(|_| "The native session binding is unreadable")?;
+    record.files_undone = true;
+    write_record(&path, &record)
 }
 
 /// Read an existing binding without creating a session, taking its run lock, or changing history.
@@ -325,6 +475,9 @@ impl Session {
         }
         let mut switched_account = false;
         let mut history_rewritten = false;
+        // The history is what the session received, as a retried message's is.
+        let mut repeats = false;
+        let mut files_undone = false;
         if import.is_some() {
             // Its first reply forks the imported session, unless a rewind since the import
             // replaced the history that session holds.
@@ -352,7 +505,13 @@ impl Session {
             if request.history_revision < previous.history_revision {
                 return Err(STALE_HISTORY.into());
             }
-            let continues = history.starts_with(&previous.history);
+            let continues = holds_received(&previous.history, &history, &request.messages)?;
+            repeats = continues && history.len() == previous.history.len();
+            files_undone = previous.files_undone
+                || request.messages.iter().enumerate().any(|(index, message)| {
+                    message.text.contains(FILES_UNDONE_MARK)
+                        && previous.history.get(index) != Some(&history[index])
+                });
             // Ordinary follow-ups add the previous final answer (or answered
             // question context after interruption), followed by one human input.
             let unseen = continues
@@ -377,21 +536,54 @@ impl Session {
                 }
             } else {
                 // Rewind and file Undo advance the history revision. Unless the retained
-                // history still continues exactly what the native session received (Undo
-                // rewind), its transcript holds discarded context: it is neither resumed nor
-                // carried to another account, and a fresh session gets the retained messages.
-                history_rewritten = !continues || unseen;
+                // history still holds all the native session received (Undo rewind, file Undo),
+                // its transcript holds discarded context: the reply continues from a fork that
+                // ends before it, or from the retained messages in a fresh session. A rewound
+                // message sent again unchanged reads like a retry, which only the rewind tells
+                // apart, also once that send failed to start.
+                let rewound =
+                    request.rewound || previous.rewound_at == Some(request.history_revision);
+                history_rewritten = !continues || unseen || (repeats && rewound);
+                if repeats && request.rewound {
+                    let mut marked = previous.clone();
+                    marked.rewound_at = Some(request.history_revision);
+                    write_record(&path, &marked)?;
+                }
             }
         }
         if request.compact && history_rewritten {
-            return Err("Send a message before compacting. After a rewind or file Undo, the next reply starts a new native session.".into());
+            return Err("Send a message before compacting. After a rewind, the next reply starts a new native session.".into());
         }
         if request.compact && (previous.is_none() || switched_account) {
             return Err("Send a message with this account first to establish its native session before compacting.".into());
         }
         // Retrying the same request under another account still continues the earlier
         // attempt's work instead of treating it as a new independent task.
-        let retry = previous.as_ref().is_some_and(|p| p.history == history);
+        let retry = repeats && !history_rewritten;
+        let sources = if history_rewritten {
+            previous.clone().into_iter().collect()
+        } else if previous.is_none() && import.is_none() {
+            fork_sources(&directory, request, &identity)
+        } else {
+            Vec::new()
+        };
+        let fork = !history_rewritten;
+        if fork && !sources.is_empty() {
+            files_undone = request
+                .messages
+                .iter()
+                .any(|message| message.text.contains(FILES_UNDONE_MARK));
+        }
+        let cut = request
+            .last_reply
+            .clone()
+            .filter(|_| !sources.is_empty())
+            .map(|reply| Cut {
+                sources,
+                reply,
+                fork,
+            });
+        let prior = previous.clone();
         let previous = previous.filter(|_| !history_rewritten);
         let import = import.filter(|_| switched_account);
         let transfer_from = previous.clone().filter(|_| switched_account).or_else(|| {
@@ -407,6 +599,10 @@ impl Session {
                 received: true,
                 shared_context: String::new(),
                 pages_rule: true,
+                ancestors: Vec::new(),
+                turns: Vec::new(),
+                rewound_at: None,
+                files_undone: false,
             })
         });
         let shared_context_changed = previous
@@ -414,6 +610,12 @@ impl Session {
             .is_some_and(|p| p.shared_context != shared_context);
         // Allocate a destination identity; prepare_transfer must succeed before sending.
         let previous = previous.filter(|_| !switched_account);
+        let ancestors = match (&previous, &prior) {
+            (Some(same), _) => same.ancestors.clone(),
+            (None, Some(replaced)) => replaced.lineage(),
+            (None, None) => Vec::new(),
+        };
+        let turns = prior.map(|record| record.turns).unwrap_or_default();
         Ok(Some(Self {
             path,
             _lock: Arc::new(lock),
@@ -421,6 +623,13 @@ impl Session {
             retry,
             switched_account,
             history_rewritten,
+            cut,
+            native_fork: None,
+            notes: if files_undone {
+                vec![FILES_UNDONE_NOTE]
+            } else {
+                Vec::new()
+            },
             shared_context_changed,
             transfer_from,
             transfer_file: None,
@@ -450,6 +659,10 @@ impl Session {
                 received: false,
                 shared_context,
                 pages_rule: true,
+                ancestors,
+                turns,
+                rewound_at: None,
+                files_undone: false,
             },
         }))
     }
@@ -471,55 +684,20 @@ impl Session {
         app: &tauri::AppHandle,
         request: &RunRequest,
     ) -> Result<(), String> {
-        use tauri::Manager;
-        let Some(previous) = self.transfer_from.as_ref() else {
+        if let Some(cut) = self.cut.take() {
+            self.continue_from_cut(app, request, &cut).await;
+        }
+        let Some(previous) = self.transfer_from.clone().filter(|_| !self.forked()) else {
             return Ok(());
         };
         if let Some(import) = self.import.clone() {
             return self.prepare_import(app, request, import).await;
         }
-        let root = app
-            .path()
-            .app_local_data_dir()
-            .map_err(|_| "Cannot locate app data")?;
-        let bytes = crate::saved::bytes(&root).map_err(|_| "Cannot read account registry")?;
-        let workspace: serde_json::Value =
-            serde_json::from_slice(&bytes).map_err(|_| "Cannot read account registry")?;
         let provider = &request.agent.provider;
         let selected = crate::profiles::current();
-        let mut candidates = vec![None];
-        candidates.extend(
-            workspace["fleet"]["connections"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .filter_map(|c| c["id"].as_str().map(|id| Some(id.to_string()))),
-        );
-        let mut source = None;
-        'connections: for connection in candidates {
-            let Ok(mut profile) = crate::profiles::resolve(app, provider, connection.as_deref())
-            else {
-                continue;
-            };
-            profile.folder_distribution = selected.folder_distribution.clone();
-            for variant in source_variants(profile) {
-                let matches = crate::profiles::scope(variant.clone(), async {
-                    identity(provider, request.location.as_ref())
-                        .is_ok_and(|i| i.scope == previous.scope)
-                })
-                .await;
-                if matches {
-                    source = Some(
-                        crate::profiles::scope(variant, async {
-                            crate::context::native_profile_root(provider).await
-                        })
-                        .await?,
-                    );
-                    break 'connections;
-                }
-            }
-        }
-        let source = source.ok_or("The previous account profile is unavailable. Reconnect it before transferring this chat; its saved history was preserved.")?;
+        let source = source_profile(app, request, &previous.scope)
+            .await?
+            .ok_or("The previous account profile is unavailable. Reconnect it before transferring this chat; its saved history was preserved.")?;
         let target = crate::context::native_profile_root(provider).await?;
         // Accounts linked to the same Claude directory (`linking`) read the same transcripts: the
         // chosen account continues the session where it is, and nothing is copied.
@@ -556,6 +734,143 @@ impl Session {
         self.pages_rule_changed = previous.before_pages_rule();
         self.unconfirmed_message = (!previous.received).then_some(previous.history.len() - 1);
         Ok(())
+    }
+
+    /// Whether this reply's session starts as a fork made for a rewind or a forked chat.
+    fn forked(&self) -> bool {
+        self.native_fork.is_some() || (self.resumed && self.transfer_path.is_some())
+    }
+
+    /// Continues a rewound chat or a new fork from the end of the reply it follows, in a fork of
+    /// the native session that holds it. When none can, the reply starts a new session from the
+    /// saved messages: nothing here fails the reply.
+    async fn continue_from_cut(&mut self, app: &tauri::AppHandle, request: &RunRequest, cut: &Cut) {
+        let provider = &request.agent.provider;
+        let Ok(target) = crate::context::native_profile_root(provider).await else {
+            return;
+        };
+        for record in &cut.sources {
+            let source = if record.scope == self.record.scope {
+                Some(target.clone())
+            } else if provider == "claude" {
+                source_profile(app, request, &record.scope)
+                    .await
+                    .ok()
+                    .flatten()
+            } else {
+                None
+            };
+            let Some(source) = source else {
+                continue;
+            };
+            if self
+                .fork_source(source, target.clone(), request, record, cut)
+                .await
+            {
+                return;
+            }
+        }
+    }
+
+    /// `continue_from_cut` for this account's own sessions, which need no account registry.
+    #[cfg(test)]
+    pub(crate) async fn fork_here(&mut self, request: &RunRequest) {
+        let Some(cut) = self.cut.take() else {
+            return;
+        };
+        let target = crate::context::native_profile_root(&request.agent.provider)
+            .await
+            .unwrap();
+        for record in &cut.sources {
+            if self
+                .fork_source(target.clone(), target.clone(), request, record, &cut)
+                .await
+            {
+                return;
+            }
+        }
+    }
+
+    /// Forks one source session: a Claude transcript copied up to the end of the reply, which
+    /// holds nothing that came after it, or a Codex thread through the reply's turn. Another
+    /// account takes only the Claude copy, since a Codex fork goes through the whole rollout.
+    async fn fork_source(
+        &mut self,
+        source: PathBuf,
+        target: PathBuf,
+        request: &RunRequest,
+        record: &Record,
+        cut: &Cut,
+    ) -> bool {
+        if request.agent.provider == "codex" {
+            let turn = record
+                .turns
+                .iter()
+                .rev()
+                .find(|turn| turn.run == cut.reply.run_id)
+                .filter(|_| record.scope == self.record.scope);
+            let Some(turn) = turn else {
+                return false;
+            };
+            self.native_fork = Some(NativeFork {
+                thread: turn.thread.clone(),
+                turn: turn.turn.clone(),
+                cwd: None,
+            });
+        } else {
+            let (sessions, reply) = (record.lineage(), cut.reply.clone());
+            let snapshot = tokio::task::spawn_blocking(move || {
+                cut_snapshot(&source, &target, &sessions, &reply)
+            })
+            .await;
+            let Ok(Ok(Some(snapshot))) = snapshot else {
+                return false;
+            };
+            let distribution = crate::profiles::current().distribution;
+            let Ok(native) = crate::shared_context::native_path(&snapshot, distribution.as_deref())
+            else {
+                return false;
+            };
+            self.transfer_path = Some(native);
+            self.transfer_file = Some(Arc::new(snapshot));
+            self.transfer_from = Some(record.clone());
+        }
+        self.resumed = true;
+        self.history_rewritten = false;
+        self.switched_account = record.scope != self.record.scope;
+        self.instructions_changed = record.instructions != self.record.instructions;
+        self.pages_rule_changed = !record.pages_rule;
+        self.shared_context_changed = record.shared_context != self.record.shared_context;
+        self.unconfirmed_message = None;
+        self.notes
+            .push(if cut.fork { FORKED_NOTE } else { REWOUND_NOTE });
+        if cut.fork && request.location.is_none() {
+            self.notes.push(FORK_FOLDER_NOTE);
+        }
+        self.record.ancestors = record.lineage();
+        self.record.turns = record.turns.clone();
+        true
+    }
+
+    /// The folder a Codex fork runs in, which it would otherwise take from the thread it forks.
+    pub fn set_fork_folder(&mut self, cwd: Option<String>) {
+        if let Some(fork) = self.native_fork.as_mut() {
+            fork.cwd = cwd;
+        }
+    }
+
+    /// Codex refused the fork, as when its thread is gone: the reply starts a new session from
+    /// the saved messages.
+    pub fn fork_refused(&mut self) {
+        let rewound = self.notes.contains(&REWOUND_NOTE);
+        self.native_fork = None;
+        self.notes.clear();
+        self.resumed = false;
+        self.history_rewritten = rewound;
+        self.instructions_changed = false;
+        self.pages_rule_changed = false;
+        self.shared_context_changed = false;
+        self.record.id = uuid::Uuid::new_v4().to_string();
     }
 
     /// Whether this reply is the first of a chat imported from a CLI session.
@@ -671,9 +986,36 @@ impl Session {
     // Persist immediately when the provider confirms its parent identity, before
     // forwarding further output, so stopped/failed replies can resume as well.
     pub fn bind(&self, id: &str, received: bool) -> Result<(), String> {
+        self.write_binding(id, received, None)
+    }
+
+    /// Binds a Codex thread whose turn has started, recording that turn for this reply so a later
+    /// rewind or fork can go through it.
+    pub fn bind_turn(&self, thread: &str, run: &str, turn: &str) -> Result<(), String> {
+        self.write_binding(
+            thread,
+            true,
+            Some(ReplyTurn {
+                run: run.into(),
+                thread: thread.into(),
+                turn: turn.into(),
+            }),
+        )
+    }
+
+    fn write_binding(
+        &self,
+        id: &str,
+        received: bool,
+        turn: Option<ReplyTurn>,
+    ) -> Result<(), String> {
         uuid::Uuid::parse_str(id)
             .map_err(|_| "The provider returned an invalid native session identity")?;
-        if self.resumed && self.transfer_path.is_none() && id != self.id() {
+        if self.resumed
+            && self.transfer_path.is_none()
+            && self.native_fork.is_none()
+            && id != self.id()
+        {
             return Err(
                 "The provider did not resume the requested native session. The reply was stopped."
                     .into(),
@@ -682,19 +1024,160 @@ impl Session {
         let mut record = self.record.clone();
         record.id = id.into();
         record.received = received;
-        let mut file = tempfile::NamedTempFile::new_in(self.path.parent().unwrap())
-            .map_err(|_| "Cannot prepare native session binding")?;
-        file.write_all(
-            &serde_json::to_vec(&record).map_err(|_| "Cannot encode native session binding")?,
-        )
-        .map_err(|_| "Cannot save native session binding")?;
-        file.as_file()
-            .sync_all()
-            .map_err(|_| "Cannot flush native session binding")?;
-        file.persist(&self.path)
-            .map_err(|_| "Cannot replace native session binding")?;
-        Ok(())
+        record.turns.extend(turn);
+        write_record(&self.path, &record)
     }
+}
+
+/// The directory of the account a binding's scope names, found in the host's own registry.
+/// `None` when no connection on this computer matches it.
+async fn source_profile(
+    app: &tauri::AppHandle,
+    request: &RunRequest,
+    scope: &str,
+) -> Result<Option<PathBuf>, String> {
+    use tauri::Manager;
+    let root = app
+        .path()
+        .app_local_data_dir()
+        .map_err(|_| "Cannot locate app data")?;
+    let bytes = crate::saved::bytes(&root).map_err(|_| "Cannot read account registry")?;
+    let workspace: serde_json::Value =
+        serde_json::from_slice(&bytes).map_err(|_| "Cannot read account registry")?;
+    let provider = &request.agent.provider;
+    let selected = crate::profiles::current();
+    let mut candidates = vec![None];
+    candidates.extend(
+        workspace["fleet"]["connections"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|c| c["id"].as_str().map(|id| Some(id.to_string()))),
+    );
+    for connection in candidates {
+        let Ok(mut profile) = crate::profiles::resolve(app, provider, connection.as_deref()) else {
+            continue;
+        };
+        profile.folder_distribution = selected.folder_distribution.clone();
+        for variant in source_variants(profile) {
+            let matches = crate::profiles::scope(variant.clone(), async {
+                identity(provider, request.location.as_ref()).is_ok_and(|i| i.scope == scope)
+            })
+            .await;
+            if matches {
+                return crate::profiles::scope(variant, async {
+                    crate::context::native_profile_root(provider).await
+                })
+                .await
+                .map(Some);
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// Whether a transcript entry starts another reply of the chat: a message the user sent, or a
+/// slash command, which Claude Code records without an origin, a compaction it asked for ahead of
+/// its command. The reply's own steering is a message too, of that reply.
+fn starts_reply(entry: &serde_json::Value, steering: &[String]) -> bool {
+    match entry["type"].as_str() {
+        Some("user") => {
+            if entry["uuid"]
+                .as_str()
+                .is_some_and(|id| steering.iter().any(|input| input == id))
+            {
+                return false;
+            }
+            let content = &entry["message"]["content"];
+            let text = content.as_str().or_else(|| content[0]["text"].as_str());
+            entry["origin"]["kind"] == "human"
+                || text.is_some_and(|text| text.starts_with("<command-"))
+        }
+        Some("system") => {
+            entry["subtype"] == "compact_boundary"
+                && entry["compactMetadata"]["trigger"] == "manual"
+        }
+        _ => false,
+    }
+}
+
+/// Whether a transcript entry is part of the conversation so far, rather than what Claude Code or
+/// Agent Studio put ahead of the next message (attachments, a reply's context, command output).
+fn in_conversation(entry: &serde_json::Value) -> bool {
+    match entry["type"].as_str() {
+        Some("assistant") => true,
+        Some("user") => {
+            let tool_result = entry["message"]["content"]
+                .as_array()
+                .is_some_and(|blocks| blocks.iter().any(|block| block["type"] == "tool_result"));
+            tool_result || entry["origin"].is_object() || entry["isCompactSummary"] == true
+        }
+        Some("system") => entry["subtype"] == "compact_boundary",
+        _ => false,
+    }
+}
+
+/// Where a copy of a Claude transcript ends to hold what the session held when `reply` ended:
+/// `None` when the reply is not in this transcript, `Some(None)` when nothing came after it. The
+/// transcript is append-only and a fork begins a new one, so what comes before that place in the
+/// file is the conversation as it stood then, compactions included.
+fn find_cut(path: &Path, reply: &LastReply) -> Result<Option<Option<u64>>, String> {
+    use std::io::{BufRead, BufReader};
+    let file = File::open(path).map_err(|_| "Cannot read the native transcript")?;
+    let mut reader = BufReader::with_capacity(1024 * 1024, file);
+    let mut line = Vec::new();
+    let (mut offset, mut kept, mut found, mut cut) = (0u64, 0u64, false, None);
+    loop {
+        line.clear();
+        let read = reader
+            .read_until(b'\n', &mut line)
+            .map_err(|_| "Cannot read the native transcript")?;
+        // A line still being written comes after any place a finished reply can end.
+        if read == 0 || !line.ends_with(b"\n") {
+            break;
+        }
+        offset += read as u64;
+        let Ok(entry) = serde_json::from_slice::<serde_json::Value>(&line) else {
+            continue;
+        };
+        if entry["isSidechain"] == true {
+            continue;
+        }
+        if entry["uuid"] == reply.run_id.as_str() {
+            found = true;
+            cut = None;
+            kept = offset;
+            continue;
+        }
+        if found && cut.is_none() && starts_reply(&entry, &reply.steering) {
+            cut = Some(kept);
+        }
+        if in_conversation(&entry) {
+            kept = offset;
+        }
+    }
+    Ok(found.then_some(cut))
+}
+
+/// A copy of the nearest session's transcript that holds `reply`, ending where that reply ended.
+fn cut_snapshot(
+    source: &Path,
+    target: &Path,
+    sessions: &[String],
+    reply: &LastReply,
+) -> Result<Option<tempfile::TempPath>, String> {
+    std::fs::create_dir_all(target).map_err(|_| "Cannot access the selected profile")?;
+    for id in sessions {
+        let Some(path) = crate::native_instructions::find_record(source, "claude", id)? else {
+            continue;
+        };
+        let Some(end) = find_cut(&path, reply)? else {
+            continue;
+        };
+        let copy = read_transcript(source, target, "claude", id, Some(path), end)?;
+        return Ok(Some(copy.copy.into_temp_path()));
+    }
+    Ok(None)
 }
 
 /// A transcript, or the recorded prefix of a history ancestor, validated as it is copied into
@@ -1445,6 +1928,615 @@ mod tests {
     fn saved(session: &Session) -> Record {
         serde_json::from_slice(&std::fs::read(&session.path).unwrap()).unwrap()
     }
+    fn entry(kind: &str, content: serde_json::Value) -> serde_json::Value {
+        json!({"type":kind,"uuid":uuid::Uuid::new_v4(),"message":{"role":kind,"content":content}})
+    }
+    fn human(id: &str, text: &str) -> serde_json::Value {
+        json!({"type":"user","uuid":id,"origin":{"kind":"human"},"message":{"role":"user","content":[{"type":"text","text":text}]}})
+    }
+    fn answer(text: &str) -> serde_json::Value {
+        entry("assistant", json!([{"type":"text","text":text}]))
+    }
+    fn tool_result(text: &str) -> serde_json::Value {
+        entry(
+            "user",
+            json!([{"type":"tool_result","tool_use_id":"t","content":text}]),
+        )
+    }
+    fn reply_context(text: &str) -> serde_json::Value {
+        entry("user", json!([{"type":"text","text":text}]))
+    }
+    fn attachment() -> serde_json::Value {
+        json!({"type":"attachment","uuid":uuid::Uuid::new_v4(),"attachment":{"type":"skill_listing"}})
+    }
+    fn boundary(trigger: &str) -> serde_json::Value {
+        json!({"type":"system","subtype":"compact_boundary","uuid":uuid::Uuid::new_v4(),"parentUuid":null,"compactMetadata":{"trigger":trigger}})
+    }
+    fn summary(text: &str) -> serde_json::Value {
+        let mut line = entry("user", json!(text));
+        line["isCompactSummary"] = json!(true);
+        line
+    }
+    /// A Claude transcript as the CLI writes it, one line an entry, each naming its session.
+    fn transcript_text(session: &str, entries: &[serde_json::Value]) -> String {
+        entries
+            .iter()
+            .map(|entry| {
+                let mut entry = entry.clone();
+                entry["sessionId"] = json!(session);
+                format!("{entry}\n")
+            })
+            .collect()
+    }
+    fn write_transcript(store: &Path, session: &str, entries: &[serde_json::Value]) -> PathBuf {
+        let folder = store.join("projects/C--work");
+        std::fs::create_dir_all(&folder).unwrap();
+        let path = folder.join(format!("{session}.jsonl"));
+        std::fs::write(&path, transcript_text(session, entries)).unwrap();
+        path
+    }
+    fn after(run: &str, steering: &[&str]) -> LastReply {
+        LastReply {
+            run_id: run.into(),
+            steering: steering.iter().map(|id| id.to_string()).collect(),
+        }
+    }
+    /// What a copy cut for `reply` holds of a transcript of `entries`.
+    fn kept_text(entries: &[serde_json::Value], reply: &LastReply) -> Option<String> {
+        let store = tempfile::tempdir().unwrap();
+        let session = uuid::Uuid::new_v4().to_string();
+        let path = write_transcript(store.path(), &session, entries);
+        let snapshot = cut_snapshot(store.path(), store.path(), &[session], reply).unwrap()?;
+        let kept = std::fs::read_to_string(&snapshot).unwrap();
+        // The original stays whole, with no copy of the transcript beside it.
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap().lines().count(),
+            entries.len()
+        );
+        Some(kept)
+    }
+    #[test]
+    fn a_copy_ends_where_the_reply_it_continues_after_ended() {
+        let (kept, removed) = (
+            uuid::Uuid::new_v4().to_string(),
+            uuid::Uuid::new_v4().to_string(),
+        );
+        let entries = [
+            reply_context("First reply's context"),
+            human(&kept, "Read the file"),
+            attachment(),
+            entry(
+                "assistant",
+                json!([{"type":"tool_use","id":"t","name":"Read","input":{}}]),
+            ),
+            tool_result("TOOL-ONLY-CODEWORD"),
+            answer("Done"),
+            attachment(),
+            reply_context("NEXT-REPLY-CONTEXT"),
+            attachment(),
+            human(&removed, "DISCARDED-MESSAGE"),
+            answer("DISCARDED-ANSWER"),
+        ];
+        let copy = kept_text(&entries, &after(&kept, &[])).unwrap();
+        assert!(copy.contains("TOOL-ONLY-CODEWORD") && copy.contains("Done"));
+        for later in [
+            "NEXT-REPLY-CONTEXT",
+            "DISCARDED-MESSAGE",
+            "DISCARDED-ANSWER",
+        ] {
+            assert!(!copy.contains(later), "{later} came through");
+        }
+        assert_eq!(copy.lines().count(), 6, "Up to its last answer");
+        // Nothing after the reply keeps the transcript whole, trailing entries included.
+        let whole = kept_text(&entries[..7], &after(&kept, &[])).unwrap();
+        assert_eq!(whole.lines().count(), 7);
+        // A reply this transcript does not hold is not cut for at all.
+        assert!(kept_text(&entries, &after(&uuid::Uuid::new_v4().to_string(), &[])).is_none());
+    }
+    #[test]
+    fn a_reply_keeps_its_steering_and_retries_go_with_the_attempt_they_retry() {
+        let ids: Vec<String> = (0..4).map(|_| uuid::Uuid::new_v4().to_string()).collect();
+        let (kept, steer, first, retry) = (&ids[0], &ids[1], &ids[2], &ids[3]);
+        let entries = [
+            human(kept, "Start"),
+            answer("Working"),
+            human(steer, "STEERING-IT-TOOK"),
+            answer("LAST-OF-THE-REPLY"),
+            human(first, "DISCARDED-FIRST-ATTEMPT"),
+            answer("A partial answer"),
+            human(retry, "Continue the previous request"),
+            answer("RETRIED-ANSWER"),
+        ];
+        let copy = kept_text(&entries, &after(kept, &[steer.as_str()])).unwrap();
+        assert!(copy.contains("STEERING-IT-TOOK") && copy.contains("LAST-OF-THE-REPLY"));
+        assert!(!copy.contains("DISCARDED-FIRST-ATTEMPT") && !copy.contains("RETRIED-ANSWER"));
+        // Steering the reply did not record reads as the next message, which keeps less.
+        let copy = kept_text(&entries, &after(kept, &[])).unwrap();
+        assert!(copy.contains("Working") && !copy.contains("STEERING-IT-TOOK"));
+        // A retried reply's own id is its last attempt: what came before it stays.
+        let copy = kept_text(&entries, &after(retry, &[])).unwrap();
+        assert_eq!(copy.lines().count(), entries.len());
+        assert!(copy.contains("DISCARDED-FIRST-ATTEMPT"));
+    }
+    #[test]
+    fn a_copy_goes_back_across_compactions_and_keeps_those_it_follows() {
+        let ids: Vec<String> = (0..4).map(|_| uuid::Uuid::new_v4().to_string()).collect();
+        let (first, compact, third, fourth) = (&ids[0], &ids[1], &ids[2], &ids[3]);
+        let mut command = entry("user", json!("<command-name>/compact</command-name>"));
+        command["uuid"] = json!(compact);
+        let mut caveat = entry(
+            "user",
+            json!("<local-command-caveat>Caveat</local-command-caveat>"),
+        );
+        caveat["isMeta"] = json!(true);
+        let entries = [
+            human(first, "First"),
+            tool_result("BEFORE-COMPACTION-RESULT"),
+            answer("First answer"),
+            // A /compact reply, as Claude Code records one.
+            boundary("manual"),
+            summary("MANUAL-SUMMARY"),
+            caveat,
+            command,
+            entry(
+                "user",
+                json!("<local-command-stdout>Compacted</local-command-stdout>"),
+            ),
+            attachment(),
+            human(third, "Third"),
+            answer("Third answer"),
+            // A compaction during a reply belongs to that reply.
+            boundary("auto"),
+            summary("AUTOMATIC-SUMMARY"),
+            answer("Third, after compacting"),
+            human(fourth, "FOURTH-MESSAGE"),
+            answer("Fourth answer"),
+        ];
+        // From before the /compact: the context as it stood, with no summary.
+        let copy = kept_text(&entries, &after(first, &[])).unwrap();
+        assert!(copy.contains("BEFORE-COMPACTION-RESULT"));
+        assert!(!copy.contains("MANUAL-SUMMARY") && !copy.contains("Third"));
+        // From the /compact reply: its summary, nothing after its command.
+        let copy = kept_text(&entries, &after(compact, &[])).unwrap();
+        assert!(copy.contains("MANUAL-SUMMARY") && !copy.contains("Compacted"));
+        assert!(!copy.contains("Third"));
+        // From a reply that compacted on its way: all of it.
+        let copy = kept_text(&entries, &after(third, &[])).unwrap();
+        assert!(copy.contains("AUTOMATIC-SUMMARY") && copy.contains("Third, after compacting"));
+        assert!(!copy.contains("FOURTH-MESSAGE"));
+    }
+    #[test]
+    fn a_copy_comes_from_the_nearest_session_holding_the_reply() {
+        let store = tempfile::tempdir().unwrap();
+        let (older, newer) = (
+            uuid::Uuid::new_v4().to_string(),
+            uuid::Uuid::new_v4().to_string(),
+        );
+        let (kept, later) = (
+            uuid::Uuid::new_v4().to_string(),
+            uuid::Uuid::new_v4().to_string(),
+        );
+        write_transcript(
+            store.path(),
+            &older,
+            &[
+                human(&kept, "Kept"),
+                answer("OLDER-SESSION"),
+                human(&later, "Gone"),
+            ],
+        );
+        // The session forked from it starts at a compaction, without the reply.
+        write_transcript(
+            store.path(),
+            &newer,
+            &[boundary("auto"), summary("Summary"), human(&later, "Later")],
+        );
+        let sessions = [newer.clone(), older.clone()];
+        let snapshot = cut_snapshot(store.path(), store.path(), &sessions, &after(&kept, &[]))
+            .unwrap()
+            .unwrap();
+        let copy = std::fs::read_to_string(&snapshot).unwrap();
+        assert!(copy.contains("OLDER-SESSION") && !copy.contains("Gone"));
+        // The nearest one wins when both hold it.
+        let snapshot = cut_snapshot(store.path(), store.path(), &sessions, &after(&later, &[]))
+            .unwrap()
+            .unwrap();
+        assert!(std::fs::read_to_string(&snapshot)
+            .unwrap()
+            .contains("Summary"));
+        // Neither holds it, and a session whose transcript is gone is passed over.
+        let gone = [uuid::Uuid::new_v4().to_string(), newer];
+        let run = uuid::Uuid::new_v4().to_string();
+        assert!(
+            cut_snapshot(store.path(), store.path(), &gone, &after(&run, &[]))
+                .unwrap()
+                .is_none()
+        );
+    }
+    #[test]
+    fn a_line_still_being_written_never_reaches_a_copy() {
+        let store = tempfile::tempdir().unwrap();
+        let (session, kept) = (
+            uuid::Uuid::new_v4().to_string(),
+            uuid::Uuid::new_v4().to_string(),
+        );
+        let later = uuid::Uuid::new_v4().to_string();
+        let path = write_transcript(
+            store.path(),
+            &session,
+            &[
+                human(&kept, "Kept"),
+                answer("Answer"),
+                human(&later, "The next reply"),
+            ],
+        );
+        let mut text = std::fs::read_to_string(&path).unwrap();
+        text.push_str("{\"type\":\"assistant\",\"partial");
+        std::fs::write(&path, text).unwrap();
+        let snapshot = cut_snapshot(store.path(), store.path(), &[session], &after(&kept, &[]))
+            .unwrap()
+            .unwrap();
+        let copy = std::fs::read_to_string(&snapshot).unwrap();
+        assert_eq!(copy.lines().count(), 2);
+        assert!(!copy.contains("partial"));
+    }
+    #[tokio::test]
+    async fn a_rewound_chat_continues_from_a_fork_that_holds_nothing_discarded() {
+        let root = tempfile::tempdir().unwrap();
+        let store = tempfile::tempdir().unwrap();
+        let mut r = request();
+        let first_run = r.run_id.clone();
+        let session = Session::prepare(root.path(), &r).unwrap().unwrap();
+        let original = session.id().to_string();
+        session.bind(&original, true).unwrap();
+        drop(session);
+        let second_run = uuid::Uuid::new_v4().to_string();
+        r.messages.extend([
+            message("assistant", "Kept answer"),
+            message("user", "Discarded"),
+        ]);
+        let session = Session::prepare(root.path(), &r).unwrap().unwrap();
+        session.bind(&original, true).unwrap();
+        drop(session);
+        write_transcript(
+            store.path(),
+            &original,
+            &[
+                human(&first_run, "Private request"),
+                tool_result("TOOL-ONLY-CODEWORD"),
+                answer("Kept answer"),
+                reply_context("Later context"),
+                human(&second_run, "DISCARDED"),
+                answer("DISCARDED-ANSWER"),
+            ],
+        );
+        // Rewound to before "Discarded", then a new question.
+        r.history_revision = 1;
+        r.messages.last_mut().unwrap().text = "A new question".into();
+        r.last_reply = Some(after(&first_run, &[]));
+        let mut session = Session::prepare(root.path(), &r).unwrap().unwrap();
+        assert!(session.history_rewritten && !session.resumed);
+        let cut = session.cut.take().unwrap();
+        let record = cut.sources[0].clone();
+        assert!(
+            session
+                .fork_source(
+                    store.path().to_path_buf(),
+                    store.path().to_path_buf(),
+                    &r,
+                    &record,
+                    &cut
+                )
+                .await
+        );
+        assert!(session.resumed && !session.history_rewritten && !session.retry);
+        assert_ne!(session.id(), original);
+        assert_eq!(session.notes, [REWOUND_NOTE]);
+        let copy = std::fs::read_to_string(session.transfer_path.as_ref().unwrap()).unwrap();
+        assert!(copy.contains("TOOL-ONLY-CODEWORD") && !copy.contains("DISCARDED"));
+        // The reply reads only its message and the note, no replay of the retained ones.
+        r.native_session = Some(session);
+        let context = r.native_context().unwrap();
+        assert!(context.contains("rewound this conversation"));
+        assert!(!context.contains("Kept answer") && !context.contains("earlier context only"));
+        assert_eq!(r.native_user_text(), "A new question");
+        assert!(!r.native_image_message(0));
+        // Its fork becomes the chat's session and remembers the one it came from.
+        let session = r.native_session.take().unwrap();
+        let fork = uuid::Uuid::new_v4().to_string();
+        session.bind(&fork, true).unwrap();
+        let bound = saved(&session);
+        assert_eq!(
+            (bound.id.as_str(), bound.ancestors.clone()),
+            (fork.as_str(), vec![original.clone()])
+        );
+        drop(session);
+        r.messages
+            .extend([message("assistant", "New answer"), message("user", "More")]);
+        let next = Session::prepare(root.path(), &r).unwrap().unwrap();
+        assert!(next.resumed && next.notes.is_empty() && next.cut.is_none());
+        assert_eq!(next.id(), fork);
+        drop(next);
+        // A rewind to a reply the sessions do not hold replays the saved messages, with no error.
+        r.history_revision = 2;
+        r.messages.truncate(2);
+        r.messages.push(message("user", "Elsewhere"));
+        r.last_reply = Some(after(&uuid::Uuid::new_v4().to_string(), &[]));
+        let mut replayed = Session::prepare(root.path(), &r).unwrap().unwrap();
+        let cut = replayed.cut.take().unwrap();
+        let record = cut.sources[0].clone();
+        assert!(
+            !replayed
+                .fork_source(
+                    store.path().to_path_buf(),
+                    store.path().to_path_buf(),
+                    &r,
+                    &record,
+                    &cut
+                )
+                .await
+        );
+        assert!(replayed.history_rewritten && !replayed.resumed && replayed.notes.is_empty());
+        r.native_session = Some(replayed);
+        assert!(r.native_context().unwrap().contains("Kept answer"));
+    }
+    #[tokio::test]
+    async fn another_account_takes_a_rewound_claude_copy_but_no_codex_rollout() {
+        let root = tempfile::tempdir().unwrap();
+        let store = tempfile::tempdir().unwrap();
+        let target = tempfile::tempdir().unwrap();
+        let (first, mut second) = (profile("claude"), profile("claude"));
+        second.root = Some(target.path().to_path_buf());
+        let mut r = request();
+        let kept = r.run_id.clone();
+        r.messages
+            .extend([message("assistant", "Answer"), message("user", "Discarded")]);
+        let original = crate::profiles::scope(first.clone(), async {
+            let s = Session::prepare(root.path(), &r).unwrap().unwrap();
+            s.bind(s.id(), true).unwrap();
+            s.id().to_string()
+        })
+        .await;
+        write_transcript(
+            store.path(),
+            &original,
+            &[
+                human(&kept, "Kept"),
+                answer("Answer"),
+                human(&uuid::Uuid::new_v4().to_string(), "DISCARDED"),
+            ],
+        );
+        r.history_revision = 1;
+        r.messages.last_mut().unwrap().text = "New".into();
+        r.last_reply = Some(after(&kept, &[]));
+        let (forked, session) = crate::profiles::scope(second.clone(), async {
+            let mut session = Session::prepare(root.path(), &r).unwrap().unwrap();
+            let cut = session.cut.take().unwrap();
+            let record = cut.sources[0].clone();
+            let forked = session
+                .fork_source(
+                    store.path().to_path_buf(),
+                    target.path().to_path_buf(),
+                    &r,
+                    &record,
+                    &cut,
+                )
+                .await;
+            (forked, session)
+        })
+        .await;
+        assert!(forked && session.resumed && session.switched_account);
+        let copy = std::fs::read_to_string(session.transfer_path.as_ref().unwrap()).unwrap();
+        assert!(copy.contains("Answer") && !copy.contains("DISCARDED"));
+        assert!(session
+            .transfer_path
+            .as_ref()
+            .unwrap()
+            .contains(&*target.path().to_string_lossy()));
+    }
+    #[tokio::test]
+    async fn a_forks_first_reply_continues_from_its_source_at_the_reply_it_was_copied_through() {
+        let root = tempfile::tempdir().unwrap();
+        let store = tempfile::tempdir().unwrap();
+        let mut source = request();
+        let kept = source.run_id.clone();
+        let session = Session::prepare(root.path(), &source).unwrap().unwrap();
+        let original = session.id().to_string();
+        session.bind(&original, true).unwrap();
+        drop(session);
+        write_transcript(
+            store.path(),
+            &original,
+            &[
+                human(&kept, "Private request"),
+                tool_result("TOOL-ONLY-CODEWORD"),
+                answer("Source answer"),
+                human(
+                    &uuid::Uuid::new_v4().to_string(),
+                    "A-LATER-MESSAGE-OF-THE-SOURCE",
+                ),
+            ],
+        );
+        // The source chat, then the fork, whose first message follows the copied reply.
+        let mut fork = request();
+        fork.forked = true;
+        fork.forked_from = vec![source.conversation_id.take().unwrap()];
+        fork.last_reply = Some(after(&kept, &[]));
+        fork.messages.extend([
+            message("assistant", "Source answer"),
+            message("user", "From the fork"),
+        ]);
+        let mut session = Session::prepare(root.path(), &fork).unwrap().unwrap();
+        assert!(!session.resumed && !session.history_rewritten);
+        assert_ne!(session.id(), original);
+        let cut = session.cut.take().unwrap();
+        assert!(cut.fork);
+        let record = cut.sources[0].clone();
+        assert!(
+            session
+                .fork_source(
+                    store.path().to_path_buf(),
+                    store.path().to_path_buf(),
+                    &fork,
+                    &record,
+                    &cut
+                )
+                .await
+        );
+        let copy = std::fs::read_to_string(session.transfer_path.as_ref().unwrap()).unwrap();
+        assert!(copy.contains("TOOL-ONLY-CODEWORD") && !copy.contains("A-LATER-MESSAGE"));
+        // A Standalone fork works in a folder of its own, which the model is told.
+        assert_eq!(session.notes, [FORKED_NOTE, FORK_FOLDER_NOTE]);
+        fork.native_session = Some(session);
+        let context = fork.native_context().unwrap();
+        assert!(context.contains("a fork of another conversation"));
+        assert!(!context.contains("Source answer") && !context.contains("earlier context only"));
+        let session = fork.native_session.take().unwrap();
+        let bound = uuid::Uuid::new_v4().to_string();
+        session.bind(&bound, true).unwrap();
+        assert_eq!(saved(&session).ancestors, std::slice::from_ref(&original));
+        drop(session);
+        // Later replies of the fork go on in its own session.
+        fork.messages
+            .extend([message("assistant", "Fork answer"), message("user", "Next")]);
+        let later = Session::prepare(root.path(), &fork).unwrap().unwrap();
+        assert!(later.resumed && later.cut.is_none() && later.notes.is_empty());
+        assert_eq!(later.id(), bound);
+        // A source that is not a conversation here, or names no binding, gives no fork.
+        let mut other = request();
+        other.forked = true;
+        other.forked_from = vec!["../other".into(), uuid::Uuid::new_v4().to_string()];
+        other.last_reply = Some(after(&kept, &[]));
+        assert!(Session::prepare(root.path(), &other)
+            .unwrap()
+            .unwrap()
+            .cut
+            .is_none());
+        // A source in another folder is not this fork's to continue.
+        let mut moved = request();
+        moved.forked_from = fork.forked_from.clone();
+        moved.last_reply = Some(after(&kept, &[]));
+        moved.location = Some(
+            serde_json::from_value(
+                json!({"computerId":uuid::Uuid::new_v4(),"environmentId":uuid::Uuid::new_v4(),"path":"C:/elsewhere"}),
+            )
+            .unwrap(),
+        );
+        assert!(Session::prepare(root.path(), &moved)
+            .unwrap()
+            .unwrap()
+            .cut
+            .is_none());
+    }
+    #[tokio::test]
+    async fn a_codex_rewind_and_fork_go_through_the_turn_that_answered_the_reply() {
+        let root = tempfile::tempdir().unwrap();
+        let unused = tempfile::tempdir().unwrap();
+        let mut r = request();
+        r.agent.provider = "codex".into();
+        let kept = r.run_id.clone();
+        let session = Session::prepare(root.path(), &r).unwrap().unwrap();
+        let thread = uuid::Uuid::new_v4().to_string();
+        session.bind(&thread, false).unwrap();
+        session.bind_turn(&thread, &kept, "turn-one").unwrap();
+        drop(session);
+        // A later reply's binding keeps the earlier turn.
+        r.messages
+            .extend([message("assistant", "Kept"), message("user", "Discarded")]);
+        r.run_id = uuid::Uuid::new_v4().to_string();
+        let session = Session::prepare(root.path(), &r).unwrap().unwrap();
+        session.bind(&thread, false).unwrap();
+        session.bind_turn(&thread, &r.run_id, "turn-two").unwrap();
+        assert_eq!(saved(&session).turns.len(), 2);
+        drop(session);
+        // Rewound to before "Discarded".
+        r.history_revision = 1;
+        r.messages.last_mut().unwrap().text = "New".into();
+        r.last_reply = Some(after(&kept, &[]));
+        let mut session = Session::prepare(root.path(), &r).unwrap().unwrap();
+        let cut = session.cut.take().unwrap();
+        let record = cut.sources[0].clone();
+        assert!(
+            session
+                .fork_source(
+                    unused.path().to_path_buf(),
+                    unused.path().to_path_buf(),
+                    &r,
+                    &record,
+                    &cut
+                )
+                .await
+        );
+        let fork = session.native_fork.clone().unwrap();
+        assert_eq!(
+            (fork.thread.as_str(), fork.turn.as_str()),
+            (thread.as_str(), "turn-one")
+        );
+        assert!(session.resumed && session.transfer_path.is_none());
+        assert_eq!(session.notes, [REWOUND_NOTE]);
+        session.set_fork_folder(Some("C:/work".into()));
+        assert_eq!(
+            session.native_fork.as_ref().unwrap().cwd.as_deref(),
+            Some("C:/work")
+        );
+        // A refused fork starts over from the saved messages.
+        session.fork_refused();
+        assert!(session.native_fork.is_none() && !session.resumed);
+        assert!(session.history_rewritten && session.notes.is_empty());
+        drop(session);
+        // A reply answered before turns were recorded has none to go through.
+        let unrecorded = uuid::Uuid::new_v4().to_string();
+        r.last_reply = Some(after(&unrecorded, &[]));
+        let mut session = Session::prepare(root.path(), &r).unwrap().unwrap();
+        let cut = session.cut.take().unwrap();
+        let record = cut.sources[0].clone();
+        assert!(
+            !session
+                .fork_source(
+                    unused.path().to_path_buf(),
+                    unused.path().to_path_buf(),
+                    &r,
+                    &record,
+                    &cut
+                )
+                .await
+        );
+        assert!(session.native_fork.is_none());
+        drop(session);
+        // A Codex fork takes its whole rollout along, so another account never gets one.
+        let mut other = request();
+        other.agent.provider = "codex".into();
+        other
+            .messages
+            .extend([message("assistant", "Kept"), message("user", "Discarded")]);
+        crate::profiles::scope(profile("codex"), async {
+            let session = Session::prepare(root.path(), &other).unwrap().unwrap();
+            let thread = uuid::Uuid::new_v4().to_string();
+            session.bind(&thread, false).unwrap();
+            session.bind_turn(&thread, &kept, "turn-one").unwrap();
+        })
+        .await;
+        other.history_revision = 1;
+        other.messages.last_mut().unwrap().text = "New".into();
+        other.last_reply = Some(after(&kept, &[]));
+        let (forked, switched, fork) = crate::profiles::scope(profile("codex"), async {
+            let mut session = Session::prepare(root.path(), &other).unwrap().unwrap();
+            let cut = session.cut.take().unwrap();
+            let record = cut.sources[0].clone();
+            let forked = session
+                .fork_source(
+                    unused.path().to_path_buf(),
+                    unused.path().to_path_buf(),
+                    &other,
+                    &record,
+                    &cut,
+                )
+                .await;
+            (forked, session.switched_account, session.native_fork)
+        })
+        .await;
+        assert!(!forked && switched && fork.is_none());
+    }
     #[tokio::test]
     async fn a_claude_session_whose_transcript_was_cleaned_up_starts_over_from_the_saved_messages()
     {
@@ -1694,19 +2786,99 @@ mod tests {
         assert_eq!(resumed.id(), original);
         resumed.bind(&original, true).unwrap();
         drop(resumed);
-        // A file Undo notes the undone edits on an earlier reply: the history no longer
-        // continues the transcript, so the next reply starts a fresh session.
-        r.history_revision = 3;
-        r.messages[1].text =
-            "Answer\n\n[The user undid this response’s recorded file edits.]".into();
+    }
+    #[test]
+    fn a_file_undo_keeps_the_session_and_tells_its_next_reply_once() {
+        let root = tempfile::tempdir().unwrap();
+        let mut r = request();
+        r.messages
+            .extend([message("assistant", "Answer"), message("user", "Continue")]);
+        let session = Session::prepare(root.path(), &r).unwrap().unwrap();
+        let original = session.id().to_string();
+        session.bind(&original, true).unwrap();
+        drop(session);
+        // A file Undo marks a reply the session already holds and advances the revision.
+        r.history_revision = 1;
+        r.messages[1].text = format!("Answer{FILES_UNDONE_MARK}");
         r.messages
             .extend([message("assistant", "Done"), message("user", "Next")]);
-        let fresh = Session::prepare(root.path(), &r).unwrap().unwrap();
-        assert!(fresh.history_rewritten && !fresh.resumed);
-        assert_ne!(fresh.id(), original);
+        let kept = Session::prepare(root.path(), &r).unwrap().unwrap();
+        assert!(kept.resumed && !kept.history_rewritten && !kept.retry);
+        assert_eq!(kept.id(), original);
+        assert_eq!(kept.notes, [FILES_UNDONE_NOTE]);
+        r.native_session = Some(kept);
+        assert!(r.native_context().unwrap().contains("restored files"));
+        assert_eq!(r.native_user_text(), "Next");
+        let kept = r.native_session.take().unwrap();
+        kept.bind(&original, true).unwrap();
+        drop(kept);
+        // The session has now been told.
+        r.messages
+            .extend([message("assistant", "Again"), message("user", "More")]);
+        let told = Session::prepare(root.path(), &r).unwrap().unwrap();
+        assert!(told.resumed && told.notes.is_empty());
+        told.bind(&original, true).unwrap();
+        drop(told);
+        // Undoing a stopped reply's edits marks no saved text: the host records it instead.
+        note_files_undone(root.path(), r.conversation_id.as_deref().unwrap()).unwrap();
+        r.history_revision = 2;
+        r.messages.push(message("user", "After stopping"));
+        let stopped = Session::prepare(root.path(), &r).unwrap().unwrap();
+        assert!(stopped.resumed && !stopped.history_rewritten);
+        assert_eq!(stopped.notes, [FILES_UNDONE_NOTE]);
+        // A mark that hides a changed reply is still a different history.
+        let other = tempfile::tempdir().unwrap();
+        let mut r = request();
+        r.messages
+            .extend([message("assistant", "Answer"), message("user", "Continue")]);
+        let session = Session::prepare(other.path(), &r).unwrap().unwrap();
+        session.bind(session.id(), true).unwrap();
+        drop(session);
+        r.history_revision = 1;
+        r.messages[1].text = format!("Another answer{FILES_UNDONE_MARK}");
+        let changed = Session::prepare(other.path(), &r).unwrap().unwrap();
+        assert!(changed.history_rewritten && !changed.resumed);
+    }
+    #[test]
+    fn a_rewound_message_sent_again_is_no_retry_even_after_a_failed_start() {
+        let root = tempfile::tempdir().unwrap();
+        let mut r = request();
+        r.messages
+            .extend([message("assistant", "Kept"), message("user", "Sent twice")]);
+        let session = Session::prepare(root.path(), &r).unwrap().unwrap();
+        let original = session.id().to_string();
+        session.bind(&original, true).unwrap();
+        drop(session);
+        // Without a rewind the same history is a retry in the same session.
+        let retried = Session::prepare(root.path(), &r).unwrap().unwrap();
+        assert!(retried.retry && retried.resumed);
+        drop(retried);
+        // Rewound and sent again unchanged, it leaves what that reply did behind.
+        r.history_revision = 1;
+        r.rewound = true;
+        r.last_reply = Some(LastReply {
+            run_id: uuid::Uuid::new_v4().to_string(),
+            steering: vec![],
+        });
+        let rewound = Session::prepare(root.path(), &r).unwrap().unwrap();
+        assert!(rewound.history_rewritten && !rewound.retry && !rewound.resumed);
+        assert!(rewound.cut.is_some());
+        assert_ne!(rewound.id(), original);
+        drop(rewound);
+        // That send never started. The page's retry no longer says a rewind came first.
+        r.rewound = false;
+        let again = Session::prepare(root.path(), &r).unwrap().unwrap();
+        assert!(again.history_rewritten && !again.retry);
+        let bound = again.id().to_string();
+        again.bind(&bound, true).unwrap();
+        drop(again);
+        // Once its session started, the same history is a retry again, in that session.
+        let later = Session::prepare(root.path(), &r).unwrap().unwrap();
+        assert!(later.retry && later.resumed && !later.history_rewritten);
+        assert_eq!(later.id(), bound);
     }
     #[tokio::test]
-    async fn rewound_history_is_neither_carried_to_another_account_nor_compacted() {
+    async fn without_its_reply_rewound_history_starts_fresh_and_is_never_compacted() {
         let root = tempfile::tempdir().unwrap();
         let mut r = request();
         let first = profile("claude");

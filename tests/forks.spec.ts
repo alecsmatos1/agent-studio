@@ -45,6 +45,10 @@ test('forks the full chat, sends nothing automatically, and preserves the source
   const request = await page.evaluate(() => JSON.parse(localStorage.getItem('test-last-request')!));
   expect(request.conversationId).toBe(fork.id);
   expect(request.forked).toBe(true);
+  // Its first reply continues the source's native session after the reply it was copied through.
+  expect(request.forkedFrom).toEqual([source.id]);
+  expect(request.lastReply).toEqual({ runId: source.messages[1].runId });
+  expect(request.rewound).toBeUndefined();
   expect(request.agent.connectionId).toBe(source.settings.connectionId);
   expect(request.messages[0].text).toBe('Original question');
   expect((await saved(page)).conversations.find((c) => c.id === source.id)).toEqual(source);

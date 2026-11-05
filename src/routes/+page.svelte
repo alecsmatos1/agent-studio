@@ -108,6 +108,7 @@
     providerIds,
     providers,
     historyFor,
+    lastReplyOf,
     messageSchema,
     messageText,
     settingsFor,
@@ -2679,8 +2680,7 @@
       throw new Error('Its reply is still running.');
     const now = new Date().toISOString();
     if (conversation.archived) conversation.archived = false;
-    delete conversation.rewind;
-    rewoundDrafts.delete(conversation.id);
+    endRewind(conversation);
     addUserMessage(conversation, { text, images: [], sentBy: 'workflow' }, now);
     return { replyId: beginWorkflowReply(conversation, now) };
   }
@@ -3922,6 +3922,14 @@
     string,
     { rewind: string; before: DraftContent; after: DraftContent }
   >();
+  // Chats whose next reply follows a rewind, which its request says (`rewound`).
+  const rewoundSends = new Set<string>();
+  /** Any submission, including a retry, ends the chance to undo a rewind. */
+  function endRewind(conversation: Conversation) {
+    if (conversation.rewind) rewoundSends.add(conversation.id);
+    delete conversation.rewind;
+    rewoundDrafts.delete(conversation.id);
+  }
   // A conversation's composer content, whether it is open or kept for its return.
   function draftOf(id: string): DraftContent {
     const key = draftKey.chat(id);
@@ -6033,8 +6041,7 @@
     if (session !== workspaceSession) return;
     const now = new Date().toISOString();
     if (conversation.archived) conversation.archived = false;
-    delete conversation.rewind;
-    rewoundDrafts.delete(conversation.id);
+    endRewind(conversation);
     addUserMessage(conversation, { ...next, images }, now);
     const { provider, model } = conversation.settings;
     const catalog = modelCache.get(modelScopeKey(conversation.settings))?.catalog ?? fallbackModels;
@@ -6203,9 +6210,7 @@
       // A workflow's chat stays under Workflows.
       if (!hiddenChats.has(conversation.id)) revealConversation(conversation);
     }
-    // Any submission, including a retry, ends the chance to undo a rewind.
-    delete conversation.rewind;
-    rewoundDrafts.delete(conversation.id);
+    endRewind(conversation);
     if (retry && conversation.messages.at(-1)?.role === 'assistant') {
       if (conversation.messages.at(-1)?.steering?.length) {
         // Preserve the steered attempt and its accepted inputs for portable history.
@@ -6431,6 +6436,9 @@
               }
             : conversation,
         );
+    // The reply this message follows, ahead of the placeholder of this one.
+    const lastReply = lastReplyOf(conversation);
+    const rewound = rewoundSends.delete(conversation.id);
     const assistantId = resume?.id ?? crypto.randomUUID();
     const responseSettings = structuredClone(
       $state.snapshot(resume?.settings ?? conversation.settings),
@@ -6477,8 +6485,7 @@
           conversation.archived = false;
           if (activeId === conversation.id) revealConversation(conversation);
         }
-        delete conversation.rewind;
-        rewoundDrafts.delete(conversation.id);
+        endRewind(conversation);
         conversation.messages.push(takeOver.user);
       }
       if (!resume) {
@@ -6551,6 +6558,11 @@
                 location: conversation.location?.path ? { ...conversation.location } : undefined,
                 ...(accountSwitch ? { accountSwitch: true } : {}),
                 ...(conversation.forked ? { forked: true } : {}),
+                ...(conversation.forkedFrom?.length
+                  ? { forkedFrom: [...conversation.forkedFrom] }
+                  : {}),
+                ...(lastReply ? { lastReply } : {}),
+                ...(rewound ? { rewound: true } : {}),
                 ...(mission ? { mission } : {}),
                 ...(takeOver
                   ? {
@@ -6863,8 +6875,7 @@
       conversation.archived = false;
       if (activeId === conversation.id) revealConversation(conversation);
     }
-    delete conversation.rewind;
-    rewoundDrafts.delete(conversation.id);
+    endRewind(conversation);
     addUserMessage(conversation, { text: continueText, images: [], sentBy: 'limit' }, now);
     const { provider, model } = conversation.settings;
     const catalog = modelCache.get(modelScopeKey(conversation.settings))?.catalog ?? fallbackModels;

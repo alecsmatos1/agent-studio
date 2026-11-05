@@ -91,13 +91,21 @@ fn start_params(request: &RunRequest) -> Value {
             params.as_object_mut().unwrap().remove("dynamicTools");
             params["threadId"] = json!(session.transfer_id().unwrap_or(session.id()));
             params["excludeTurns"] = json!(true);
+            // A rewound chat or a new fork goes on from the turn of the reply it follows.
+            if let Some(fork) = &session.native_fork {
+                params["threadId"] = json!(fork.thread);
+                params["lastTurnId"] = json!(fork.turn);
+                if let Some(cwd) = &fork.cwd {
+                    params["cwd"] = json!(cwd);
+                }
+            }
         }
     }
     params
 }
 fn thread_method(request: &RunRequest) -> &'static str {
     match request.native_session.as_ref() {
-        Some(s) if s.transfer_path.is_some() => "thread/fork",
+        Some(s) if s.transfer_path.is_some() || s.native_fork.is_some() => "thread/fork",
         Some(s) if s.resumed => "thread/resume",
         _ => "thread/start",
     }
@@ -412,6 +420,20 @@ pub async fn run(
                     }
                     if kind == Kind::Interrupt { continue; }
                     if value["error"].is_object() {
+                        // A thread or turn the fork names may be gone: the reply goes on from the
+                        // saved messages in a thread of its own.
+                        if kind == Kind::Thread {
+                            if let Some(session) = request.native_session.as_mut().filter(|s| s.native_fork.is_some()) {
+                                session.fork_refused();
+                                if session.history_rewritten {
+                                    if let Some(channel) = channel {
+                                        let _ = channel.send(crate::protocol::RunEvent::Progress { id: "studio-session-rewound".into(), revision: 1, text: super::sessions::REWIND_REPLAYED.into() });
+                                    }
+                                }
+                                send(process, &mut pending, Kind::Thread, thread_method(request), start_params(request)).await?;
+                                continue;
+                            }
+                        }
                         process.healthy = false;
                         return Err(if kind == Kind::Thread && request.native_session.as_ref().is_some_and(|s| s.resumed) {
                             "Codex could not resume this conversation's native session. Its saved history was preserved. Check the selected CLI profile, or start a new conversation; no message was replayed."
@@ -468,7 +490,10 @@ pub async fn run(
                         }
                         Kind::Turn => {
                             if let Some(id) = value["result"]["turn"]["id"].as_str() { turn = id.into(); }
-                            if let Some(session) = &request.native_session { session.bind(&thread, true)?; }
+                            if let Some(session) = &request.native_session {
+                                if turn.is_empty() { session.bind(&thread, true)?; }
+                                else { session.bind_turn(&thread, &request.run_id, &turn)?; }
+                            }
                             questions.steering.ready(!request.compact && !turn.is_empty() && !cancelling);
                         }
                         Kind::Interrupt | Kind::Steer => {}
@@ -534,6 +559,10 @@ pub async fn run(
                 }
                 if value["method"] == "turn/started" && value["params"]["threadId"] == thread {
                     turn = value["params"]["turn"]["id"].as_str().unwrap_or_default().into();
+                    // A compaction's turn is known only from here.
+                    if let (Some(session), false) = (&request.native_session, turn.is_empty()) {
+                        session.bind_turn(&thread, &request.run_id, &turn)?;
+                    }
                 }
                 questions.resolved_codex(&value, &thread);
                 questions.elicitation.observe(&value, Some(&thread));
@@ -712,6 +741,42 @@ mod tests {
         assert_eq!(turn["input"][0]["text"], "Continue");
         assert_eq!(turn["effort"], "high");
         assert_eq!(turn["summary"], "auto");
+    }
+    #[test]
+    fn a_fork_goes_through_its_turn_and_a_refused_one_starts_a_thread_from_the_saved_messages() {
+        let root = tempfile::tempdir().unwrap();
+        let mut request: RunRequest = serde_json::from_value(json!({"runId":uuid::Uuid::new_v4(),"conversationId":uuid::Uuid::new_v4(),"agent":{"provider":"codex","model":"fixture","instructions":""},"messages":[{"role":"user","text":"Earlier request"},{"role":"assistant","text":"Earlier answer"},{"role":"user","text":"Next"}]})).unwrap();
+        let mut session = super::super::sessions::Session::prepare(root.path(), &request)
+            .unwrap()
+            .unwrap();
+        session.resumed = true;
+        session.native_fork = Some(super::super::sessions::NativeFork {
+            thread: "source-thread".into(),
+            turn: "kept-turn".into(),
+            cwd: Some("C:/work".into()),
+        });
+        request.native_session = Some(session);
+        assert_eq!(thread_method(&request), "thread/fork");
+        let params = start_params(&request);
+        assert_eq!(params["threadId"], "source-thread");
+        assert_eq!(params["lastTurnId"], "kept-turn");
+        assert_eq!(params["cwd"], "C:/work");
+        assert_eq!(params["excludeTurns"], true);
+        assert!(params.get("dynamicTools").is_none());
+        let turn = turn_params(&request, "forked-thread");
+        assert_eq!(turn["input"].as_array().unwrap().len(), 1);
+        assert_eq!(turn["input"][0]["text"], "Next");
+        let session = request.native_session.as_mut().unwrap();
+        session.fork_refused();
+        assert_eq!(thread_method(&request), "thread/start");
+        let params = start_params(&request);
+        assert!(params.get("lastTurnId").is_none() && params.get("threadId").is_none());
+        assert!(params["dynamicTools"].is_array());
+        let turn = turn_params(&request, "new-thread");
+        assert!(turn["input"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("Earlier answer"));
     }
     #[test]
     fn only_current_skills_are_native_inputs_and_arguments_remain_literal() {

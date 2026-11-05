@@ -1534,6 +1534,8 @@ async fn undo(
         })
         .await?;
         if preview.undone {
+            // The session goes on, and its next reply is told the files changed under it.
+            let _ = providers::sessions::note_files_undone(&root, &conversation_id);
             // Save the receipt on the executing host even if the requesting Viewer
             // disconnects before receiving its result. Retrying is idempotent.
             let mut saved = storage.0.lock().map_err(|_| "Storage lock failed")?;

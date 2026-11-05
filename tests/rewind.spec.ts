@@ -101,6 +101,16 @@ test('a rewind is saved with its returned message, can be undone after reload, a
   expect(request.messages.map((m: any) => m.text)).not.toContain('Second prompt');
   expect(request.messages.at(-1).text).toBe('Replacement prompt');
   await expect(page.getByRole('button', { name: 'Undo rewind' })).toHaveCount(0);
+  // The host forks the native session after the reply it kept, which only this send asks for.
+  expect(request.rewound).toBe(true);
+  expect(request.lastReply.runId).toEqual(expect.any(String));
+  await input.fill('A later prompt');
+  await page.getByRole('button', { name: 'Send message', exact: true }).click();
+  await expect(page.getByRole('button', { name: 'Stop response' })).toHaveCount(0);
+  const later = await page.evaluate(() => JSON.parse(localStorage.getItem('test-last-request')!));
+  expect(later.messages.at(-1).text).toBe('A later prompt');
+  expect(later.rewound).toBeUndefined();
+  expect(later.lastReply.runId).not.toBe(request.lastReply.runId);
 });
 
 test('rewind handles the first message, storage failure, slash commands, and phone layout', async ({

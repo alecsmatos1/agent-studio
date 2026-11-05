@@ -69,6 +69,10 @@ describe('conversation forks', () => {
       location: original.location,
     });
     expect(fork.id).not.toBe(original.id);
+    // Its first reply forks the source's native session, or an earlier chat's when a fork of a
+    // fork has no session of its own yet.
+    expect(fork.forkedFrom).toEqual([original.id]);
+    expect(forkConversation(fork).forkedFrom).toEqual([fork.id, original.id]);
     expect(fork.createdAt).not.toBe(original.createdAt);
     expect(fork.messages.every((m) => !original.messages.some((o) => o.id === m.id))).toBe(true);
     expect(historyFor(fork)).toEqual(historyFor(original));

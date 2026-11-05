@@ -503,6 +503,7 @@ pub(crate) async fn execute(
                         .get_current_dir()
                         .map(|p| p.to_string_lossy().into_owned())
                 };
+                session.set_fork_folder(cwd.clone());
                 let missing = tokio::select! {
                     missing = session.verify_transcript(&exe, cwd) => missing,
                     _ = cancel.cancelled() => return Ok(("cancelled".into(), String::new())),
@@ -556,7 +557,11 @@ pub(crate) async fn execute(
                         let _ = channel.send(RunEvent::Progress { id: "studio-session-missing".into(), revision: 1, text: "Claude Code no longer has this chat's earlier session on this computer (it removes sessions unused for a while), so this reply continues from the saved messages. Earlier tool details and compacted context are not carried over.".into() });
                     } else if session.history_rewritten {
                         if request.messages.len() > 1 {
-                            let _ = channel.send(RunEvent::Progress { id: "studio-session-rewound".into(), revision: 1, text: "Starting a new native session from the retained messages after a rewind or file Undo. Earlier tool details and compacted context are not carried over.".into() });
+                            let _ = channel.send(RunEvent::Progress {
+                                id: "studio-session-rewound".into(),
+                                revision: 1,
+                                text: crate::providers::sessions::REWIND_REPLAYED.into(),
+                            });
                         }
                     } else if session.switched_account {
                         let _ = channel.send(RunEvent::Progress { id: "studio-account-switch".into(), revision: 1, text: "Continuing the latest native conversation history under the selected account. Saved tool results and compacted context are carried forward; live terminals and background processes are not restarted.".into() });

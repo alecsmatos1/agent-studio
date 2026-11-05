@@ -50,6 +50,8 @@ export function forkConversation(source: Conversation, messageId?: string): Conv
   return {
     id: crypto.randomUUID(),
     forked: true,
+    // A fork without a reply of its own has no native session: its source's sources hold it.
+    forkedFrom: [source.id, ...(source.forkedFrom ?? [])],
     title: `${source.title} (fork)`,
     titleStatus: 'generated',
     settings: structuredClone(

@@ -622,6 +622,16 @@ pub struct RunRequest {
     // Portable forks with prior messages still receive a new Standalone folder.
     #[serde(default)]
     pub forked: bool,
+    // The chats a fork was copied from, nearest first, whose native sessions its first reply forks.
+    #[serde(default)]
+    pub forked_from: Vec<String>,
+    // The reply this message follows, the end of which a rewound chat or a new fork continues from.
+    #[serde(default)]
+    pub last_reply: Option<sessions::LastReply>,
+    // A rewind came before this message, which the history alone cannot tell when the same
+    // message is sent again.
+    #[serde(default)]
+    pub rewound: bool,
     // Internal background requests must never inherit interactive chat permissions.
     #[serde(skip)]
     pub conversation_only: bool,
@@ -1043,6 +1053,7 @@ impl RunRequest {
             if session.pages_rule_changed && self.uses_claude_visualizer() {
                 context.push(crate::artifacts::pages_rule_changed());
             }
+            context.extend(session.notes.iter().map(|note| note.to_string()));
             if session.instructions_changed {
                 context.push(format!("Current user instructions for this conversation (replace earlier conversation instructions): {}", serde_json::to_string(&self.agent.instructions).unwrap()));
             }
@@ -1675,6 +1686,9 @@ mod tests {
             conversation_only: false,
             account_switch: false,
             forked: false,
+            forked_from: Vec::new(),
+            last_reply: None,
+            rewound: false,
             location: None,
             run_id: uuid::Uuid::new_v4().to_string(),
             claude_instructions: None,

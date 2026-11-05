@@ -1935,3 +1935,334 @@ async fn installed_claude_hears_the_guidance_again_after_a_compaction() {
     assert!(heard.concat().contains("mcp__agent_studio__send_files"));
     assert!(answer.contains("send_files"), "{answer}");
 }
+
+/// A rewound chat and a new fork go on with what their session held at that point: the codeword
+/// only a tool result carried, deleted from disk since, and none of what came after. Once across
+/// a compaction, and a fork while its source's process is still there, as a parked one is.
+#[tokio::test]
+#[ignore = "Opt-in installed Claude CLI test; uses subscription capacity."]
+async fn installed_claude_rewinds_and_forks_keep_their_native_context() {
+    const CODEWORD: &str = "MARIGOLD-7741";
+    const ASK: &str = "Use no tool. On one line: what codeword did secret.txt hold when you read it, what fruit and what vegetable did I ask you to remember? Say none for what you have no record of.";
+    let folder = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let runtime = root.path().join("chat-runtime");
+    std::fs::create_dir_all(&runtime).unwrap();
+    let secret = folder.path().join("secret.txt");
+    std::fs::write(&secret, format!("The codeword is {CODEWORD}.\n")).unwrap();
+    let exe = crate::providers::resolve("claude").await.unwrap();
+    let profile = crate::context::native_profile_root("claude").await.unwrap();
+    let cwd = folder.path().to_string_lossy().into_owned();
+    let (computer, environment) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+    let location = json!({"computerId":computer,"environmentId":environment,"path":cwd});
+    let conversation = uuid::Uuid::new_v4().to_string();
+    let request = |run: &str, revision: u64, messages: &serde_json::Value| -> RunRequest {
+        serde_json::from_value(json!({"runId":run,"conversationId":conversation,
+            "historyRevision":revision,"location":location,
+            "agent":{"provider":"claude","model":"haiku","instructions":""},"messages":messages}))
+        .unwrap()
+    };
+    let prepare = |mut request: RunRequest| {
+        let root = root.path().to_path_buf();
+        async move {
+            let mut session = crate::providers::sessions::Session::prepare(&root, &request)
+                .unwrap()
+                .unwrap();
+            session.fork_here(&request).await;
+            request.native_session = Some(session);
+            request
+        }
+    };
+    let start = |request: RunRequest| {
+        let (exe, runtime) = (exe.clone(), runtime.clone());
+        async move {
+            let mut command = crate::providers::chat_command(&request, &runtime, &exe)
+                .await
+                .unwrap();
+            let id = request.native_session.as_ref().unwrap().id().to_string();
+            let mut process =
+                crate::pool::Process::new(exe, command.spawn().unwrap(), "rewind".into(), id)
+                    .unwrap();
+            let (tx, mut received) = tokio::sync::mpsc::unbounded_channel();
+            let channel = EventSink::new(move |event| {
+                let _ = tx.send(event);
+                Ok(())
+            });
+            let mut questions = Questions::default()
+                .open(&request.run_id, None, channel.clone())
+                .unwrap();
+            let result = tokio::time::timeout(
+                Duration::from_secs(300),
+                stream_turn(
+                    &mut process,
+                    &request,
+                    Some(&channel),
+                    CancellationToken::new(),
+                    Some(&mut questions),
+                    false,
+                ),
+            )
+            .await
+            .expect("Installed CLI test timed out");
+            drop(channel);
+            while received.try_recv().is_ok() {}
+            let (status, text) = result.expect("Installed CLI failed");
+            assert_eq!(status, "complete", "{text}");
+            (text, process)
+        }
+    };
+    let say = |role: &str, text: &str| json!({"role":role,"text":text});
+    let new_run = || uuid::Uuid::new_v4().to_string();
+    let bound = |conversation: &str| -> String {
+        let bytes = std::fs::read(
+            root.path()
+                .join("native-sessions")
+                .join(format!("{conversation}.json")),
+        )
+        .unwrap();
+        serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    let transcript = |session: &str| -> String {
+        std::fs::read_to_string(
+            crate::native_instructions::find_record(&profile, "claude", session)
+                .unwrap()
+                .expect("A saved transcript"),
+        )
+        .unwrap()
+    };
+
+    // A tool result only the session holds, then a message a rewind discards.
+    let read_it = "Use the Read tool on secret.txt, then reply with only the word DONE. Do not repeat what it says.";
+    let run1 = new_run();
+    let mut messages = vec![say("user", read_it)];
+    let (first_answer, mut process) =
+        start(prepare(request(&run1, 0, &json!(messages))).await).await;
+    process.kill().await;
+    std::fs::remove_file(&secret).unwrap();
+    let original = bound(&conversation);
+    assert!(transcript(&original).contains(CODEWORD));
+    messages.push(say("assistant", &first_answer));
+    let kept = messages.clone();
+    messages.push(say(
+        "user",
+        "Remember the fruit PAPAYA-2093. Reply only OK.",
+    ));
+    let (_, mut process) = start(prepare(request(&new_run(), 0, &json!(messages))).await).await;
+    process.kill().await;
+    assert_eq!(bound(&conversation), original, "A follow-up resumes");
+    assert!(transcript(&original).contains("PAPAYA-2093"));
+
+    // Rewound to before the fruit, with a new question.
+    let mut messages = kept;
+    messages.push(say("user", ASK));
+    let mut rewound = request(&new_run(), 1, &json!(messages));
+    rewound.rewound = true;
+    rewound.last_reply = serde_json::from_value(json!({"runId":run1})).unwrap();
+    let rewound = prepare(rewound).await;
+    let session = rewound.native_session.as_ref().unwrap();
+    assert!(session.resumed && session.transfer_path.is_some() && !session.history_rewritten);
+    let ask_run = rewound.run_id.clone();
+    let (answer, mut process) = start(rewound).await;
+    process.kill().await;
+    eprintln!("After the rewind: {answer}");
+    assert!(answer.contains(CODEWORD), "{answer}");
+    assert!(!answer.contains("PAPAYA-2093"), "{answer}");
+    let forked = bound(&conversation);
+    assert_ne!(
+        forked, original,
+        "The rewound chat has a session of its own"
+    );
+    assert!(
+        transcript(&original).contains("PAPAYA-2093"),
+        "The original stays"
+    );
+    assert!(!transcript(&forked).contains("PAPAYA-2093"));
+    assert!(
+        transcript(&forked).contains(&ask_run),
+        "Its entries keep their ids"
+    );
+
+    // A compaction and a later message, then a rewind to before the compaction.
+    messages.push(say("assistant", &answer));
+    let before_compaction = messages.clone();
+    messages.push(say("user", "/compact"));
+    let mut compact = request(&new_run(), 1, &json!(messages));
+    compact.compact = true;
+    let (_, mut process) = start(prepare(compact).await).await;
+    process.kill().await;
+    assert!(transcript(&forked).contains("compact_boundary"));
+    messages.push(say("assistant", "Compacted"));
+    messages.push(say(
+        "user",
+        "Remember the vegetable OKRA-5512. Reply only OK.",
+    ));
+    let (_, mut process) = start(prepare(request(&new_run(), 1, &json!(messages))).await).await;
+    process.kill().await;
+    assert_eq!(bound(&conversation), forked);
+    assert!(transcript(&forked).contains("OKRA-5512"));
+
+    let mut messages = before_compaction;
+    messages.push(say("user", ASK));
+    let mut uncompacted = request(&new_run(), 2, &json!(messages));
+    uncompacted.rewound = true;
+    uncompacted.last_reply = serde_json::from_value(json!({"runId":ask_run})).unwrap();
+    let uncompacted = prepare(uncompacted).await;
+    assert!(uncompacted.native_session.as_ref().unwrap().resumed);
+    let second_ask = uncompacted.run_id.clone();
+    let (answer, mut process) = start(uncompacted).await;
+    process.kill().await;
+    eprintln!("From before the compaction: {answer}");
+    assert!(answer.contains(CODEWORD), "{answer}");
+    assert!(!answer.contains("OKRA-5512"), "{answer}");
+    let again = bound(&conversation);
+    assert_ne!(again, forked);
+    assert!(
+        !transcript(&again).contains("compact_boundary"),
+        "The context as it stood before compacting"
+    );
+
+    // A fork of the chat, with the source's process still there.
+    messages.push(say("assistant", &answer));
+    let source_run = new_run();
+    let mut held_messages = messages.clone();
+    held_messages.push(say(
+        "user",
+        "Remember the color CERULEAN-3301. Reply only OK.",
+    ));
+    let (_, mut source) =
+        start(prepare(request(&source_run, 2, &json!(held_messages))).await).await;
+    let fork_id = uuid::Uuid::new_v4().to_string();
+    messages.push(say("user", ASK));
+    let mut fork = request(&new_run(), 0, &json!(messages));
+    fork.conversation_id = Some(fork_id.clone());
+    fork.forked = true;
+    fork.forked_from = vec![conversation.clone()];
+    fork.last_reply = serde_json::from_value(json!({"runId":second_ask})).unwrap();
+    let fork = prepare(fork).await;
+    assert!(fork.native_session.as_ref().unwrap().resumed);
+    let (answer, mut process) = start(fork).await;
+    process.kill().await;
+    source.kill().await;
+    eprintln!("In the fork: {answer}");
+    assert!(answer.contains(CODEWORD), "{answer}");
+    assert!(!answer.contains("CERULEAN-3301"), "{answer}");
+    let fork_session = bound(&fork_id);
+    assert!(!transcript(&fork_session).contains("CERULEAN-3301"));
+    assert!(
+        transcript(&bound(&conversation)).contains("CERULEAN-3301"),
+        "The source goes on"
+    );
+
+    // The project folder named after the throwaway folder holds only this test's files.
+    let saved = crate::native_instructions::find_record(&profile, "claude", &original)
+        .unwrap()
+        .unwrap();
+    std::fs::remove_dir_all(saved.parent().unwrap()).unwrap();
+}
+
+/// A fork of a Standalone chat works in a folder of its own, and goes on with its source's context.
+#[tokio::test]
+#[ignore = "Opt-in installed Claude CLI test; uses subscription capacity."]
+async fn installed_claude_forks_a_standalone_chat_into_its_own_folder() {
+    let root = tempfile::tempdir().unwrap();
+    let runtime = root.path().join("chat-runtime");
+    std::fs::create_dir_all(&runtime).unwrap();
+    let exe = crate::providers::resolve("claude").await.unwrap();
+    let profile = crate::context::native_profile_root("claude").await.unwrap();
+    let source_id = uuid::Uuid::new_v4().to_string();
+    let run = uuid::Uuid::new_v4().to_string();
+    let reply = |request: RunRequest| {
+        let (exe, runtime) = (exe.clone(), runtime.clone());
+        async move {
+            let mut command = crate::providers::chat_command(&request, &runtime, &exe)
+                .await
+                .unwrap();
+            let id = request.native_session.as_ref().unwrap().id().to_string();
+            let folder = command.as_std().get_current_dir().map(|p| p.to_path_buf());
+            let mut process =
+                crate::pool::Process::new(exe, command.spawn().unwrap(), "fork".into(), id)
+                    .unwrap();
+            let (tx, mut received) = tokio::sync::mpsc::unbounded_channel();
+            let channel = EventSink::new(move |event| {
+                let _ = tx.send(event);
+                Ok(())
+            });
+            let mut questions = Questions::default()
+                .open(&request.run_id, None, channel.clone())
+                .unwrap();
+            let result = tokio::time::timeout(
+                Duration::from_secs(300),
+                stream_turn(
+                    &mut process,
+                    &request,
+                    Some(&channel),
+                    CancellationToken::new(),
+                    Some(&mut questions),
+                    false,
+                ),
+            )
+            .await
+            .expect("Installed CLI test timed out");
+            process.kill().await;
+            drop(channel);
+            while received.try_recv().is_ok() {}
+            let (status, text) = result.expect("Installed CLI failed");
+            assert_eq!(status, "complete", "{text}");
+            (text, folder)
+        }
+    };
+    let remember = "Remember the codeword KESTREL-2093 for later. Reply only OK.";
+    let mut source: RunRequest =
+        serde_json::from_value(json!({"runId":run,"conversationId":source_id,
+        "agent":{"provider":"claude","model":"haiku","instructions":""},
+        "messages":[{"role":"user","text":remember}]}))
+        .unwrap();
+    source.native_session =
+        crate::providers::sessions::Session::prepare(root.path(), &source).unwrap();
+    let original = source.native_session.as_ref().unwrap().id().to_string();
+    let (answer, source_folder) = reply(source).await;
+    let fork_id = uuid::Uuid::new_v4().to_string();
+    let mut fork: RunRequest = serde_json::from_value(json!({"runId":uuid::Uuid::new_v4(),"conversationId":fork_id,
+        "forked":true,"forkedFrom":[source_id],"lastReply":{"runId":run},
+        "agent":{"provider":"claude","model":"haiku","instructions":""},
+        "messages":[{"role":"user","text":remember},{"role":"assistant","text":answer},
+        {"role":"user","text":"What was the codeword? Reply with the codeword only, using no tool."}]}))
+    .unwrap();
+    // As a reply does, whose first look at its folder comes before its session.
+    crate::standalone::prepare(root.path(), &fork).unwrap();
+    let mut session = crate::providers::sessions::Session::prepare(root.path(), &fork)
+        .unwrap()
+        .unwrap();
+    session.fork_here(&fork).await;
+    assert!(session.resumed && session.transfer_path.is_some());
+    assert!(session
+        .notes
+        .iter()
+        .any(|note| note.contains("folder of its own")));
+    let forked = session.id().to_string();
+    fork.native_session = Some(session);
+    let (answer, fork_folder) = reply(fork).await;
+    eprintln!("Fork answered {answer} in {fork_folder:?}, source ran in {source_folder:?}");
+    assert!(answer.contains("KESTREL-2093"), "{answer}");
+    assert_ne!(fork_folder, source_folder);
+    assert!(
+        fork_folder
+            .as_ref()
+            .is_some_and(|folder| folder.to_string_lossy().contains("standalone")),
+        "A folder of its own, not the shared one"
+    );
+    let paths = [
+        crate::native_instructions::find_record(&profile, "claude", &original)
+            .unwrap()
+            .unwrap(),
+        crate::native_instructions::find_record(&profile, "claude", &forked)
+            .unwrap()
+            .unwrap(),
+    ];
+    for path in paths {
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+}

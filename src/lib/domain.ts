@@ -315,6 +315,8 @@ export const conversationSchema = z.object({
   id: z.string().uuid(),
   // A portable history copy starts a new Standalone folder even with prior messages.
   forked: z.literal(true).optional(),
+  // The chats it was copied from, nearest first, whose native sessions its first reply forks.
+  forkedFrom: z.array(z.string().uuid()).optional(),
   location: locationSchema.optional(),
   archived: z.boolean().optional(),
   settings: chatSettingsSchema,
@@ -441,6 +443,13 @@ export type RunRequest = {
   // host starts a fresh native session for the selected account from the saved messages.
   accountSwitch?: boolean;
   forked?: boolean;
+  forkedFrom?: string[];
+  // The reply this message follows, the end of which a rewound chat or a new fork continues from
+  // in a fork of the native session that holds it.
+  lastReply?: { runId: string; steering?: string[] };
+  // A rewind came before this message, which the history alone cannot tell when the same message
+  // is sent again.
+  rewound?: boolean;
   agent: ChatSettings;
   // Workspace-wide Claude chat instructions, appended to the CLI's system prompt.
   claudeInstructions?: string;
@@ -475,6 +484,9 @@ export const messageText = (message: Message) =>
     .filter((b) => b.type === 'markdown')
     .map((b) => b.text)
     .join('\n\n');
+/** What a file Undo adds to a reply's saved text, which the host recognizes in a binding's history. */
+export const filesUndoneMark =
+  '\n\n[The user undid this response’s recorded file edits after the response. Check the current files before continuing.]';
 export function historyFor(conversation: Conversation): RunRequest['messages'] {
   // Interrupted and failed responses never become fabricated assistant history.
   return conversation.messages
@@ -489,9 +501,7 @@ export function historyFor(conversation: Conversation): RunRequest['messages'] {
       role: m.role === 'assistant' && m.status !== 'complete' ? ('user' as const) : m.role,
       text:
         (m.role === 'assistant' && m.status !== 'complete' ? '' : messageText(m)) +
-        (m.filesUndone
-          ? '\n\n[The user undid this response’s recorded file edits after the response. Check the current files before continuing.]'
-          : '') +
+        (m.filesUndone ? filesUndoneMark : '') +
         (m.role === 'assistant'
           ? questionHistory(m.questions) +
             steeringHistory(m.steering) +
@@ -512,6 +522,13 @@ export function historyFor(conversation: Conversation): RunRequest['messages'] {
     .filter(
       (m) => m.text.trim() || m.images?.length || m.visualizations?.length || m.artifacts?.length,
     );
+}
+/** The conversation's latest reply as a run request names it (`lastReply`). */
+export function lastReplyOf(conversation: Pick<Conversation, 'messages'>) {
+  const reply = conversation.messages.findLast((m) => m.role === 'assistant' && m.runId);
+  if (!reply?.runId) return undefined;
+  const steering = reply.steering?.map((input) => input.id) ?? [];
+  return { runId: reply.runId, ...(steering.length ? { steering } : {}) };
 }
 // Loading a saved workspace cannot regain a run that was live when the app stopped.
 export const interruptedReplyError = 'This response was interrupted when the app closed.';
