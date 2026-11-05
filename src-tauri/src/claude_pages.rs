@@ -109,6 +109,16 @@ fn destination(url: &str) -> Destination {
     }
 }
 
+/// Whether a window a page opens on a click stays in the pane's session instead of going to the
+/// browser. Continue with Google opens Google's sign-in in a window and takes the result from it
+/// through `window.opener`, which a window in the browser does not have: it ended blank at
+/// `gsi/transform`, and claude.ai, handed no window, showed its sign-in error.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn answers_its_opener(url: &str) -> bool {
+    tauri::Url::parse(url)
+        .is_ok_and(|url| url.scheme() == "https" && url.host_str() == Some("accounts.google.com"))
+}
+
 /// Shows an artifact in its account's pane, or hides the pane a view showed.
 #[tauri::command]
 pub async fn claude_page(
@@ -179,7 +189,9 @@ pub fn window_moved() {
 
 #[cfg(windows)]
 mod native {
-    use super::{destination, Bounds, Destination, Request, ENDED_EVENT, FOCUS_EVENT};
+    use super::{
+        answers_its_opener, destination, Bounds, Destination, Request, ENDED_EVENT, FOCUS_EVENT,
+    };
     use std::cell::RefCell;
     use tauri::{AppHandle, Manager};
     use windows::Win32::{
@@ -407,8 +419,9 @@ mod native {
     }
 
     /// Tells the page when the pane takes or leaves keyboard focus, opens the windows its pages
-    /// ask for in the browser, as a click did, and closes the pane once its browser process ends,
-    /// which leaves it empty for good: Reload then builds it again.
+    /// ask for in the browser, as a click did, but for a sign-in window that answers the page
+    /// that opened it, which WebView2 opens itself, and closes the pane once its browser process
+    /// ends, which leaves it empty for good: Reload then builds it again.
     fn watch(app: &AppHandle, webview: &WebView, account: &str, container: isize) {
         use webview2_com::{
             FocusChangedEventHandler,
@@ -432,13 +445,18 @@ mod native {
             // SAFETY: WebView2 calls this on the window thread with live event arguments, and
             // the address it returns is freed by `take_pwstr`.
             unsafe {
-                args.SetHandled(true)?;
                 let mut clicked = BOOL(0);
                 args.IsUserInitiated(&mut clicked)?;
+                let clicked = clicked.as_bool();
                 let mut uri = PWSTR::null();
                 args.Uri(&mut uri)?;
                 let uri = webview2_com::take_pwstr(uri);
-                if clicked.as_bool() && destination(&uri) != Destination::Nowhere {
+                // Not handled, which undoes wry's own handler before this one, WebView2 opens
+                // the window itself in this session, with its address shown and no way into the
+                // app, and it closes with the app.
+                let opens_here = clicked && answers_its_opener(&uri);
+                args.SetHandled(!opens_here)?;
+                if clicked && !opens_here && destination(&uri) != Destination::Nowhere {
                     open_outside(&opener, &uri);
                 }
             }
@@ -610,6 +628,32 @@ mod tests {
             ..SLOT
         };
         assert!(request(Some(broken)).checked().is_err());
+    }
+
+    #[test]
+    fn only_google_s_sign_in_window_keeps_its_opener() {
+        for url in [
+            "https://accounts.google.com/o/oauth2/v2/auth?client_id=x&display=popup",
+            "https://accounts.google.com/gsi/select",
+            "HTTPS://ACCOUNTS.GOOGLE.COM/",
+        ] {
+            assert!(answers_its_opener(url), "{url}");
+        }
+        for url in [
+            "http://accounts.google.com/",
+            "https://accounts.google.com.example.com/",
+            "https://accounts.google.com@example.com/",
+            "https://example.com/accounts.google.com",
+            "https://example.com/?u=https://accounts.google.com/",
+            "https://google.com/",
+            "https://claude.ai/",
+            "https://appleid.apple.com/auth/authorize",
+            "javascript:alert(1)",
+            "about:blank",
+            "",
+        ] {
+            assert!(!answers_its_opener(url), "{url}");
+        }
     }
 
     #[test]
