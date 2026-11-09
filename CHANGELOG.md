@@ -5,6 +5,24 @@ each GitHub release uses its section as release notes. `npm run release:version`
 version's section from the commit subjects since the previous release; edit it before committing.
 See [automatic updates](docs/UPDATES.md#publishing-a-release).
 
+## 1.2.1 - 2026-11-09
+
+### Changed
+
+- Keep tool details and compacted context after a rewind or a fork: the next reply continues from
+  a fork of the chat's session that ends at the last kept reply, instead of a new session built
+  from the visible messages. When no session holds that reply, it starts from the saved messages
+  and says so
+- Keep a chat's session after Undo edits, and tell the next reply once that its files were
+  restored
+
+### Fixed
+
+- Sign in to claude.ai with Continue with Google inside the app: the sign-in went to the browser
+  and ended on a blank page
+- Keep following a chat when its reply ends just after you send a message: the chat stopped short
+  of its end
+
 ## 1.2.0 - 2026-11-04
 
 ### Added
