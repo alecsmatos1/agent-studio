@@ -601,11 +601,14 @@ pub async fn run(
                     // An interrupted turn leaves the thread loaded for the next reply.
                     if status == "interrupted" { return Ok(("cancelled".into(), decoder.text)); }
                     if status != "completed" {
+                        // A turn refused at the usage limit leaves the thread loaded and the
+                        // server waiting, for the reply that continues after the reset.
+                        if let Some(limit) = decoder.usage_limit.take() {
+                            process.limited = true;
+                            return Err(limit.text);
+                        }
                         process.healthy = false;
-                        return Err(match decoder.usage_limit.take() {
-                            Some(limit) => limit.text,
-                            None => "Codex could not complete the reply. Check its login, model access, and connection.".into(),
-                        });
+                        return Err("Codex could not complete the reply. Check its login, model access, and connection.".into());
                     }
                     if request.compact {
                         if !decoder.compactions.completed() { process.healthy = false; return Err("Codex ended without confirming compaction. The conversation was preserved.".into()); }

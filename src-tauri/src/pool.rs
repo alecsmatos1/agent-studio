@@ -1,6 +1,7 @@
-//! Parked per-conversation CLI processes. A completed or interrupted reply leaves its
-//! Claude or Codex process waiting on stdin so the conversation's next reply can continue
-//! in the same process, keeping its integrations, background work, and token counters.
+//! Parked per-conversation CLI processes. A completed or interrupted reply, or one a usage
+//! limit stopped, leaves its Claude or Codex process waiting on stdin so the conversation's
+//! next reply can continue in the same process, keeping its integrations, background work,
+//! and token counters.
 //! A process is reused only when the launch identity still matches; anything else restarts.
 //! Closing a chat is the user's decision: a parked process stays until its chat moves to
 //! History or is deleted, a later reply needs a different launch, or the app quits. Nothing
@@ -79,6 +80,13 @@ pub struct Process {
     /// False once the protocol state is unknown (an interrupt that never confirmed, a
     /// desynchronized response); such a process is killed instead of parked.
     pub healthy: bool,
+    /// The turn this process just served ended at the account's usage limit, with the CLI
+    /// idle and well: only that request was refused. The process parks for the reply that
+    /// continues the chat after the reset, as after a finished reply. A fresh process would
+    /// resume the session from its transcript, and Claude Code then attaches the project's
+    /// CLAUDE.md again in full when it changed meanwhile, which can push a long chat past its
+    /// compaction threshold at once.
+    pub limited: bool,
     /// Codex: the loaded thread, its reported model, and the next JSON-RPC request id.
     pub thread: String,
     pub reported_model: Option<String>,
@@ -160,6 +168,7 @@ impl Process {
             claude_settings: None,
             session_id,
             healthy: true,
+            limited: false,
             thread: String::new(),
             reported_model: None,
             next_id: 1,

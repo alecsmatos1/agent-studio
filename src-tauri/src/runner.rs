@@ -684,6 +684,8 @@ pub(crate) async fn execute(
         .await
     };
     process.turns += 1;
+    // It describes only the turn that just ended, never one this process serves later.
+    let limited = std::mem::take(&mut process.limited);
     if let Some(watch) = &process.background {
         watch.detach(&request.run_id);
     }
@@ -699,11 +701,8 @@ pub(crate) async fn execute(
         }
         return result;
     }
-    // A finished or cleanly interrupted turn leaves the CLI waiting for the next reply.
-    let park = parkable
-        && process.healthy
-        && matches!(&result, Ok((status, _)) if status == "complete" || status == "cancelled")
-        && process.alive();
+    let park =
+        parkable && process.healthy && waits_for_next_reply(&result, limited) && process.alive();
     if park {
         pool.park(request.conversation_id.as_deref().unwrap(), process)
             .await;
@@ -713,6 +712,15 @@ pub(crate) async fn execute(
         process.kill().await;
     }
     result
+}
+/// Whether a reply's end leaves its CLI waiting for the conversation's next reply: a finished
+/// or cleanly interrupted turn, or one the account's usage limit refused (`Process::limited`),
+/// so the reply that continues the chat after the reset resumes in the same process.
+fn waits_for_next_reply(result: &Result<(String, String), String>, limited: bool) -> bool {
+    match result {
+        Ok((status, _)) => status == "complete" || status == "cancelled",
+        Err(_) => limited,
+    }
 }
 /// How long a Claude reply waits for the turn that reports finished background tasks the
 /// model declared. The CLI starts that turn right after its previous result.
@@ -1195,12 +1203,14 @@ async fn stream_turn(
                     ));
                 }
                 if let Some(failure) = decoder.failure.take() {
-                    process.healthy = false;
                     // The provider's own line names the limit that stopped the reply and its reset.
-                    break Err(match decoder.usage_limit.take() {
-                        Some(limit) => limit.text,
-                        None => provider_error(&format!("{diagnostics} {failure}")).into(),
-                    });
+                    // The CLI refused only that request and waits for the next message.
+                    if let Some(limit) = decoder.usage_limit.take() {
+                        process.limited = true;
+                        break Err(limit.text);
+                    }
+                    process.healthy = false;
+                    break Err(provider_error(&format!("{diagnostics} {failure}")).into());
                 }
                 if request.compact {
                     if !decoder.compactions.completed() {

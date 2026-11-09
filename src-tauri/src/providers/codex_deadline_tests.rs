@@ -31,6 +31,15 @@ while ($null -ne ($line = [Console]::ReadLine())) {
         'turn/start' {
             $env:STUDIO_TEST_TURNS = [string]([int]$env:STUDIO_TEST_TURNS + 1)
             [Console]::WriteLine('{"id":' + $id + ',"result":{"turn":{"id":"turn' + $env:STUDIO_TEST_TURNS + '"}}}')
+            $limit = Join-Path (Split-Path $PSCommandPath) 'limit'
+            if (Test-Path -LiteralPath $limit) {
+                # The account is at its usage limit once: Codex fails the turn, keeping its thread.
+                Remove-Item -LiteralPath $limit
+                $refusal = '{"message":"You''ve hit your usage limit. Try again at 3:05 PM.","codexErrorInfo":"usageLimitExceeded"}'
+                [Console]::WriteLine('{"method":"error","params":{"threadId":"fixture","turnId":"turn' + $env:STUDIO_TEST_TURNS + '","willRetry":false,"error":' + $refusal + '}}')
+                [Console]::WriteLine('{"method":"turn/completed","params":{"threadId":"fixture","turn":{"id":"turn' + $env:STUDIO_TEST_TURNS + '","status":"failed","error":' + $refusal + '}}}')
+                continue
+            }
             if (Test-Path -LiteralPath (Join-Path (Split-Path $PSCommandPath) 'tool-progress')) {
                 [Console]::WriteLine('{"method":"item/started","params":{"threadId":"fixture","turnId":"turn1","item":{"type":"commandExecution","id":"cmd","status":"inProgress"}}}')
                 [Console]::WriteLine('{"method":"item/commandExecution/outputDelta","params":{"threadId":"fixture","turnId":"stale","itemId":"cmd","delta":"PRIVATE_STALE"}}')
@@ -439,5 +448,58 @@ async fn a_parked_process_serves_the_next_reply_without_restarting_the_thread() 
     for excluded in ["PRIVATE_HOOK_OUTPUT", "foreign-hook", "stale-hook"] {
         assert!(!metadata.contains(excluded));
     }
+    process.kill().await;
+}
+
+#[tokio::test]
+async fn a_usage_limit_keeps_the_thread_for_the_reply_after_the_reset() {
+    let folder = tempfile::tempdir().unwrap();
+    let gate = folder.path().join("finish");
+    std::fs::write(&gate, "open").unwrap();
+    std::fs::write(folder.path().join("limit"), "once").unwrap();
+    let mut process = fixture(folder.path(), &gate, false);
+    let (events, _received) = tokio::sync::mpsc::unbounded_channel();
+    let channel = EventSink::new(move |event| events.send(event).map_err(|e| e.to_string()));
+    let request: RunRequest = serde_json::from_value(json!({"runId":uuid::Uuid::new_v4(),"agent":{"provider":"codex","model":"fixture","instructions":""},"messages":[{"role":"user","text":"First"}]})).unwrap();
+    let mut questions = Questions::default()
+        .open(&request.run_id, None, channel.clone())
+        .unwrap();
+    let refused = run(
+        &mut process,
+        &request,
+        Some(&channel),
+        CancellationToken::new(),
+        &mut questions,
+        None,
+        false,
+    )
+    .await;
+    assert_eq!(
+        refused.unwrap_err(),
+        "You've hit your usage limit. Try again at 3:05 PM."
+    );
+    // Codex refused that turn alone: the server waits with its thread loaded, so it parks.
+    assert!(process.alive() && process.healthy && process.limited);
+    process.limited = false;
+    process.turns += 1;
+    process.park();
+    process.claim();
+    let next: RunRequest = serde_json::from_value(json!({"runId":uuid::Uuid::new_v4(),"agent":{"provider":"codex","model":"fixture","instructions":""},"messages":[{"role":"user","text":"First"},{"role":"assistant","text":""},{"role":"user","text":"Continue where you left off."}]})).unwrap();
+    let mut questions = Questions::default()
+        .open(&next.run_id, None, channel.clone())
+        .unwrap();
+    let continued = run(
+        &mut process,
+        &next,
+        Some(&channel),
+        CancellationToken::new(),
+        &mut questions,
+        None,
+        true,
+    )
+    .await
+    .unwrap();
+    assert_eq!(continued, ("complete".into(), "READY2".into()));
+    assert!(process.alive() && process.healthy && !process.limited);
     process.kill().await;
 }

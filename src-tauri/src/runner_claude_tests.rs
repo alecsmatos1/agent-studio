@@ -251,23 +251,18 @@ async fn claude_tool_progress_native_loop_ticks_without_output_or_late_revival()
 async fn a_usage_limit_ends_the_reply_with_claude_codes_own_line() {
     let root = tempfile::tempdir().unwrap();
     let conversation = uuid::Uuid::new_v4().to_string();
-    let request = request(
+    let first = request(
         root.path(),
         &conversation,
         serde_json::json!([{"role":"user","text":"Limit"}]),
     );
-    let session = request.native_session.as_ref().unwrap().id().to_string();
+    let session = first.native_session.as_ref().unwrap().id().to_string();
     let mut process = fixture(root.path(), &session, false, false);
-    let (result, events) = turn(
-        &mut process,
-        &request,
-        CancellationToken::new(),
-        false,
-        false,
-    )
-    .await;
-    assert!(!process.healthy);
-    process.kill().await;
+    process.fingerprint = crate::pool::fingerprint(&first, &process.exe).unwrap();
+    let (result, events) = turn(&mut process, &first, CancellationToken::new(), false, false).await;
+    // Only that request was refused: the CLI waits for the next message, so the reply parks it.
+    assert!(process.healthy && process.alive() && process.limited);
+    assert!(waits_for_next_reply(&result, true));
     let line = "You've hit your session limit \u{b7} resets 1:50pm (America/Sao_Paulo)";
     assert_eq!(result.unwrap_err(), line);
     let limits: Vec<_> = events
@@ -284,6 +279,44 @@ async fn a_usage_limit_ends_the_reply_with_claude_codes_own_line() {
         RunEvent::Progress { text, .. } | RunEvent::Text { text } if text.contains("hit your"))));
     assert!(events.iter().any(|e| matches!(e, RunEvent::Usage { usage }
         if usage.model.as_deref() == Some("fixture-model") && usage.context_input == Some(100))));
+    // The chat goes on after the reset in the same CLI, which never resumes the session afresh.
+    let pid = process.child.id();
+    process.limited = false;
+    process.turns += 1;
+    process.park();
+    drop(first);
+    let next = request(
+        root.path(),
+        &conversation,
+        serde_json::json!([
+            {"role":"user","text":"Limit"},
+            {"role":"assistant","text":""},
+            {"role":"user","text":"Continue where you left off."}
+        ]),
+    );
+    let fingerprint = crate::pool::fingerprint(&next, &process.exe).unwrap();
+    assert!(process.serves(&fingerprint, next.native_session.as_ref().unwrap()));
+    process.claim();
+    let (result, _) = turn(&mut process, &next, CancellationToken::new(), true, false).await;
+    assert_eq!(result.unwrap(), ("complete".into(), "Turn 2".into()));
+    assert_eq!(process.child.id(), pid);
+    assert!(process.healthy && !process.limited);
+    process.kill().await;
+}
+
+#[test]
+fn only_finished_stopped_or_limited_replies_keep_their_cli() {
+    let ended = |status: &str| Ok((status.to_string(), String::new()));
+    assert!(waits_for_next_reply(&ended("complete"), false));
+    assert!(waits_for_next_reply(&ended("cancelled"), false));
+    assert!(waits_for_next_reply(
+        &Err("You've hit your weekly limit".into()),
+        true
+    ));
+    assert!(!waits_for_next_reply(
+        &Err("Claude could not resume".into()),
+        false
+    ));
 }
 
 #[tokio::test]
