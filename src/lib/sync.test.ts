@@ -9,6 +9,7 @@ import {
   type Message,
 } from './domain';
 import {
+  applySharedMeta,
   emptyShared,
   mergeShared,
   metaOf,
@@ -24,6 +25,7 @@ import { sameFolderIcons } from './folder-icons';
 import { assignAccountColors, withAccountColor } from './account-colors';
 import { withSnooze, withoutSnooze } from './snoozes';
 import { withPin, withoutPin } from './pins';
+import { withMove, withoutRanks } from './sidebar-order';
 import { snapshotFor, type UsageSnapshot } from './usage';
 
 const chat = (): Conversation => ({
@@ -241,6 +243,62 @@ describe('workspace replication', () => {
     const saved = restoreWorkspace({ ...initialWorkspace(), pins: local.pins });
     expect(saved.pins).toEqual(local.pins);
     expect(sharedWorkspace(saved).pins).toEqual(local.pins);
+  });
+  it("syncs the sidebar's order and keeps it when the relay predates it", () => {
+    const [a, b, c] = [chat(), chat(), chat()];
+    const at = new Date(2026, 10, 9);
+    const base = {
+      ...emptyShared(),
+      sidebarOrder: withMove(undefined, 'chats', [a.id, b.id], b.id, 0, at),
+    };
+    // One device moves a folder, the other a chat: both moves stand.
+    const local = {
+      ...base,
+      sidebarOrder: withMove(base.sidebarOrder, 'folders', ['one', 'two'], 'two', 0, at),
+    };
+    const remote = {
+      ...base,
+      sidebarOrder: withMove(base.sidebarOrder, 'chats', [b.id, a.id, c.id], c.id, 0, at),
+    };
+    const merged = mergeShared(base, local, remote);
+    expect(merged.sidebarOrder?.folders).toEqual(local.sidebarOrder?.folders);
+    expect(merged.sidebarOrder?.chats).toEqual(remote.sidebarOrder?.chats);
+    expect(sharedSchema.parse(merged).sidebarOrder).toEqual(merged.sidebarOrder);
+    // A deleted chat's place goes on the other device too.
+    const forgot = { ...local, sidebarOrder: withoutRanks(local.sidebarOrder, 'chats', [a.id]) };
+    expect(mergeShared(local, forgot, local).sidebarOrder).toEqual(forgot.sidebarOrder);
+    expect(mergeShared(local, local, forgot).sidebarOrder).toEqual(forgot.sidebarOrder);
+    // An older relay drops the order; this device keeps its own and sees no difference.
+    const older = emptyShared();
+    expect(mergeShared(base, local, older).sidebarOrder).toEqual(local.sidebarOrder);
+    expect(sameShared(older, local)).toBe(true);
+    expect(sameShared(local, older)).toBe(false);
+    expect(sameMeta(metaOf(older), metaOf(local))).toBe(false);
+    expect(sameMeta(metaOf(forgot), metaOf(local))).toBe(false);
+    expect('sidebarOrder' in mergeShared(emptyShared(), emptyShared(), older)).toBe(false);
+    const saved = restoreWorkspace({ ...initialWorkspace(), sidebarOrder: local.sidebarOrder });
+    expect(saved.sidebarOrder).toEqual(local.sidebarOrder);
+    expect(sharedWorkspace(saved).sidebarOrder).toEqual(local.sidebarOrder);
+  });
+  it('applies every replicated setting a sync received', () => {
+    const kept = chat();
+    const received = {
+      ...emptyShared(),
+      claudeInstructions: '',
+      pins: withPin(undefined, kept.id, new Date(2026, 10, 9)),
+      sidebarOrder: withMove(undefined, 'folders', ['one', 'two'], 'two', 0),
+    };
+    const workspace = { ...initialWorkspace(), conversations: [kept] };
+    applySharedMeta(workspace, metaOf(received));
+    expect(sameMeta(metaOf(sharedWorkspace(workspace)), metaOf(received))).toBe(true);
+    expect(workspace.pins).toEqual(received.pins);
+    expect(workspace.sidebarOrder).toEqual(received.sidebarOrder);
+    expect(workspace.conversations).toEqual([kept]);
+    // Settings the relay no longer holds go here too.
+    applySharedMeta(workspace, emptyShared());
+    expect(workspace.pins).toBeUndefined();
+    expect(workspace.sidebarOrder).toBeUndefined();
+    expect(workspace.conversations).toEqual([kept]);
   });
   it('migrates v2 and registers only this installation without inventing remote machines or accounts', () => {
     const old = {

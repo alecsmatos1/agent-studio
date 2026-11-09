@@ -2238,9 +2238,9 @@ export async function pollRelay(urgent = false): Promise<Presence[] | null> {
         for (let attempt = 0; attempt < 4; attempt++) {
           remoteShared ??= sharedSchema.parse(remote.workspace);
           const merged = mergeShared(baseline, start, remoteShared, options);
-          // An older relay or app drops app sessions, folder icons, account colors, snoozes and
-          // pins. This device keeps its own and sends them with its next other change, instead of
-          // writing them back after every write there.
+          // An older relay or app drops app sessions, folder icons, account colors, snoozes, pins
+          // and the sidebar's order. This device keeps its own and sends them with its next other
+          // change, instead of writing them back after every write there.
           const unsent = {
             ...merged,
             ...(!remote.workspace.appSessions && merged.appSessions
@@ -2254,6 +2254,9 @@ export async function pollRelay(urgent = false): Promise<Presence[] | null> {
               : {}),
             ...(!remote.workspace.snoozes && merged.snoozes ? { snoozes: undefined } : {}),
             ...(!remote.workspace.pins && merged.pins ? { pins: undefined } : {}),
+            ...(!remote.workspace.sidebarOrder && merged.sidebarOrder
+              ? { sidebarOrder: undefined }
+              : {}),
           };
           const mergedJson = JSON.stringify(unsent);
           if (mergedJson === JSON.stringify(remote.workspace)) {

@@ -306,6 +306,15 @@
     withoutSnooze,
   } from '$lib/snoozes';
   import { pinIndex, withPin, withoutPin } from '$lib/pins';
+  import { orderIndex, withMove, withoutRanks } from '$lib/sidebar-order';
+  import {
+    focusItem,
+    keyToReorder,
+    orderList,
+    pressToReorder,
+    type MoveOptions,
+    type OrderList,
+  } from '$lib/reorder';
   import {
     continueStep,
     continueText,
@@ -329,7 +338,13 @@
     type Installation,
     type WslDiscovery,
   } from '$lib/fleet';
-  import { replaceFields, sharedMeta, sharedWorkspace, type Presence } from '$lib/sync';
+  import {
+    applySharedMeta,
+    replaceFields,
+    sharedMeta,
+    sharedWorkspace,
+    type Presence,
+  } from '$lib/sync';
   import {
     fallbackModels,
     fastModeBlock,
@@ -896,6 +911,16 @@
     trigger: HTMLButtonElement;
     x: number;
     y: number;
+    // Opened by a touch, it also moves the chat within its list.
+    order?: OrderList;
+  } | null>(null);
+  // A folder's or computer's menu, held open on a touch screen to move it.
+  let headingMenu = $state<{
+    name: string;
+    trigger: HTMLButtonElement;
+    x: number;
+    y: number;
+    order: OrderList;
   } | null>(null);
   const menuConversation = $derived(
     conversationMenu?.scratch
@@ -913,6 +938,7 @@
   let touchMenuTimer: ReturnType<typeof setTimeout> | undefined;
   let touchMenuOrigin: { x: number; y: number } | undefined;
   let longPressedConversation: string | undefined;
+  let longPressedHeading: EventTarget | undefined;
   let composerInput = $state<HTMLTextAreaElement>();
   let chatScroll = $state<HTMLDivElement>();
   let chatColumn = $state<HTMLDivElement>();
@@ -1797,6 +1823,8 @@
   let today = $state(startOfDay(Date.now()));
   // Chats pinned to the top of the tab they are in, Active or History.
   const pinsByChat = $derived(pinIndex(workspace.pins));
+  // Where chats, folders and computers were moved by hand.
+  const sidebarPlaces = $derived(orderIndex(workspace.sidebarOrder));
   const conversationGroups = $derived(
     groupConversations(
       recent,
@@ -1806,6 +1834,7 @@
       workspace.appSessions,
       today,
       pinsByChat,
+      sidebarPlaces,
     ),
   );
   const iconsByFolder = $derived(folderIconIndex(workspace.folderIcons));
@@ -3373,14 +3402,7 @@
               if (activeId === conversation.id) void scrollToEnd(true);
             },
             apply: async (value) => {
-              workspace.fleet = value.fleet;
-              workspace.workflows = value.workflows;
-              workspace.inputTemplates = value.inputTemplates;
-              workspace.claudeInstructions = value.claudeInstructions;
-              workspace.appSessions = value.appSessions;
-              workspace.folderIcons = value.folderIcons;
-              workspace.accountColors = value.accountColors;
-              workspace.snoozes = value.snoozes;
+              applySharedMeta(workspace, value);
               const kept = new Set(value.conversations.map((c) => c.id));
               const deleted = workspace.conversations.filter((c) => !kept.has(c.id));
               // Preserve active object identities while network responses arrive.
@@ -3422,16 +3444,7 @@
             // Only the conversations a sync merged, so an unrelated chat is never rewritten.
             openChat: () => activeId ?? undefined,
             applyChats: async (upsert, remove, meta, wholes) => {
-              if (meta) {
-                workspace.fleet = meta.fleet;
-                workspace.workflows = meta.workflows;
-                workspace.inputTemplates = meta.inputTemplates;
-                workspace.claudeInstructions = meta.claudeInstructions;
-                workspace.appSessions = meta.appSessions;
-                workspace.folderIcons = meta.folderIcons;
-                workspace.accountColors = meta.accountColors;
-                workspace.snoozes = meta.snoozes;
-              }
+              if (meta) applySharedMeta(workspace, meta);
               const gone = new Set(remove);
               if (gone.size)
                 workspace.conversations = workspace.conversations.filter((c) => !gone.has(c.id));
@@ -5067,6 +5080,7 @@
         [],
         Date.now(),
         pinsByChat,
+        sidebarPlaces,
       );
     const next = open
       ? (nextActiveConversation(conversationGroups, c.id) ??
@@ -5213,6 +5227,11 @@
     if (!loaded) return;
     const pins = $state.snapshot(workspace.pins);
     workspace.pins = pinsByChat.has(c.id) ? withoutPin(pins, c.id) : withPin(pins, c.id);
+    // A chat pinned anew leads the pinned chats, wherever it was placed among them before.
+    if (sidebarPlaces.pinned.has(c.id))
+      workspace.sidebarOrder = withoutRanks($state.snapshot(workspace.sidebarOrder), 'pinned', [
+        c.id,
+      ]);
     saveSettingsSoon();
   }
   // The context menu's Pin and Unpin. The row moves between the pinned chats and its folder, and
@@ -5233,6 +5252,40 @@
         sidebarElement?.querySelector<HTMLElement>('.conversation-tabs [aria-selected="true"]')
       )?.focus({ preventScroll: !keyboard }),
     );
+  }
+  // Chats, folders and computers moved by hand keep the order their list now shows, on every
+  // device. A search shows only part of each list, so nothing moves while searching.
+  const reorderable = () => loaded && !query;
+  function reorder(list: OrderList, to: number, { focus, keyboard }: MoveOptions) {
+    if (!reorderable()) return;
+    const id = list.ids[list.index];
+    workspace.sidebarOrder = withMove(
+      $state.snapshot(workspace.sidebarOrder),
+      list.space,
+      list.ids,
+      id,
+      to,
+    );
+    saveSettingsSoon();
+    if (focus) void tick().then(() => focusItem(list.container, id, !keyboard));
+  }
+  function pressToMove(event: PointerEvent) {
+    if (reorderable()) pressToReorder(event, reorder);
+  }
+  function keyToMove(event: KeyboardEvent) {
+    if (reorderable()) keyToReorder(event, reorder);
+  }
+  // On touch screens, where nothing is dragged, a menu moves its item one place.
+  function menuMoves(list: OrderList | undefined, close: () => void) {
+    if (!list) return {};
+    const by = (step: number) => (event: MouseEvent) => {
+      close();
+      reorder(list, list.index + step, { focus: true, keyboard: event.detail === 0 });
+    };
+    return {
+      ...(list.index > 0 ? { moveUp: by(-1) } : {}),
+      ...(list.index < list.ids.length - 1 ? { moveDown: by(1) } : {}),
+    };
   }
   // Chats the Claude Code and Codex CLIs saved on this computer, imported into History.
   let importOpen = $state(false);
@@ -5447,13 +5500,14 @@
   function openConversationMenu(event: MouseEvent | KeyboardEvent, id: string, scratch = false) {
     event.preventDefault();
     cancelTouchMenu();
-    if ('pointerType' in event && event.pointerType === 'touch') longPressedConversation = id;
+    const touch = 'pointerType' in event && event.pointerType === 'touch';
+    if (touch) longPressedConversation = id;
     const trigger = event.currentTarget as HTMLButtonElement;
     const bounds = trigger.getBoundingClientRect();
     const pointer = 'clientX' in event && (event.clientX !== 0 || event.clientY !== 0);
     conversationMenu = {
       id,
-      ...(scratch ? { scratch } : {}),
+      ...(scratch ? { scratch } : touch ? touchOrder(trigger) : {}),
       trigger,
       x: pointer ? event.clientX : bounds.left + 12,
       y: pointer ? event.clientY : bounds.bottom,
@@ -5482,8 +5536,58 @@
       touchMenuOrigin = undefined;
       if (!trigger.isConnected || !trigger.getClientRects().length) return;
       longPressedConversation = id;
-      conversationMenu = { id, ...(scratch ? { scratch } : {}), trigger, x, y };
+      conversationMenu = { id, ...(scratch ? { scratch } : touchOrder(trigger)), trigger, x, y };
     }, 500);
+  }
+  // The list a menu opened by a touch moves its chat, folder or computer in, when it can move.
+  function touchOrder(trigger: HTMLElement): { order?: OrderList } {
+    const order = reorderable() ? orderList(trigger) : undefined;
+    return order && order.ids.length > 1 ? { order } : {};
+  }
+  function closeHeadingMenu(restoreFocus = false) {
+    const trigger = headingMenu?.trigger;
+    headingMenu = null;
+    if (restoreFocus) void tick().then(() => trigger?.focus({ preventScroll: true }));
+  }
+  function showHeadingMenu(trigger: HTMLButtonElement, name: string, x: number, y: number) {
+    if (!trigger.isConnected || !trigger.getClientRects().length) return;
+    const { order } = touchOrder(trigger);
+    if (!order) return;
+    longPressedHeading = trigger;
+    headingMenu = { name, trigger, x, y, order };
+  }
+  // A folder's or computer's heading: pressed with the mouse or a pen and moved, it drags its
+  // group; held on a touch screen, it opens a menu that moves it; Alt with an arrow moves it.
+  const headingHandlers = (name: string) => ({
+    onpointerdown: (event: PointerEvent) => {
+      cancelTouchMenu();
+      longPressedHeading = undefined;
+      if (event.pointerType !== 'touch') return pressToMove(event);
+      const trigger = event.currentTarget as HTMLButtonElement;
+      const x = event.clientX,
+        y = event.clientY;
+      touchMenuOrigin = { x, y };
+      touchMenuTimer = setTimeout(() => {
+        touchMenuOrigin = undefined;
+        showHeadingMenu(trigger, name, x, y);
+      }, 500);
+    },
+    onpointermove: moveTouchMenu,
+    onpointerup: cancelTouchMenu,
+    onpointercancel: cancelTouchMenu,
+    oncontextmenu: (event: MouseEvent) => {
+      if (!('pointerType' in event) || event.pointerType !== 'touch') return;
+      event.preventDefault();
+      cancelTouchMenu();
+      showHeadingMenu(event.currentTarget as HTMLButtonElement, name, event.clientX, event.clientY);
+    },
+    onkeydown: keyToMove,
+  });
+  // The tap ending a touch that opened a heading's menu leaves its group folded as it was.
+  function heldHeading(event: MouseEvent) {
+    if (longPressedHeading !== event.currentTarget) return false;
+    longPressedHeading = undefined;
+    return true;
   }
   function requestConversationDeletion() {
     if (!conversationMenu || !menuConversation || deleting) return;
@@ -5566,6 +5670,11 @@
       }
       if (pinsByChat.has(target.id)) {
         workspace.pins = withoutPin($state.snapshot(workspace.pins), target.id);
+        marks.meta();
+      }
+      if (sidebarPlaces.chats.has(target.id) || sidebarPlaces.pinned.has(target.id)) {
+        const order = withoutRanks($state.snapshot(workspace.sidebarOrder), 'chats', [target.id]);
+        workspace.sidebarOrder = withoutRanks(order, 'pinned', [target.id]);
         marks.meta();
       }
       // The saved order leaves it out, and a sync sees it gone from the baseline.
@@ -7146,7 +7255,7 @@
     plan,
     snoozed,
   )}
-  <div class="conversation-row">
+  <div class="conversation-row" data-order={c.id}>
     <button
       class="conversation-item"
       class:pinned-item={!!pinned}
@@ -7154,12 +7263,18 @@
       aria-current={activeId === c.id && view === 'chat' ? 'page' : undefined}
       aria-haspopup="menu"
       data-conversation={c.id}
+      data-order-handle
+      aria-keyshortcuts="Alt+ArrowUp Alt+ArrowDown"
       oncontextmenu={(event) => openConversationMenu(event, c.id)}
       onkeydown={(event) => {
         if (event.key === 'ContextMenu' || (event.shiftKey && event.key === 'F10'))
           openConversationMenu(event, c.id);
+        else keyToMove(event);
       }}
-      onpointerdown={(event) => startTouchMenu(event, c.id)}
+      onpointerdown={(event) => {
+        startTouchMenu(event, c.id);
+        pressToMove(event);
+      }}
       onpointermove={moveTouchMenu}
       onpointerup={cancelTouchMenu}
       onpointercancel={cancelTouchMenu}
@@ -7424,6 +7539,7 @@
           tabindex="0"
           aria-labelledby={`conversation-tab-${group.id}`}
           hidden={conversationScope !== group.id}
+          data-order-space={group.id === 'active' ? 'computers' : undefined}
         >
           {#if group.id === 'active' && listedRuns.length}<section
               class="running-workflows"
@@ -7523,7 +7639,7 @@
               <h2 id={`pinned-heading-${group.id}`} class="snoozed-heading">
                 <Pin size={13} aria-hidden="true" />Pinned
               </h2>
-              <div class="pinned-conversations">
+              <div class="pinned-conversations" data-order-space="pinned">
                 {#each group.pinned as pinned (pinned.conversation.id)}{@render conversationRow(
                     pinned.conversation,
                     pinned,
@@ -7537,13 +7653,21 @@
               aria-label={section.kind === 'computer'
                 ? `${section.name} ${group.name.toLowerCase()} chats`
                 : section.detail}
+              data-order={section.kind === 'computer' ? section.id : undefined}
+              data-order-space="folders"
             >
               {#if section.kind === 'computer'}<div class="computer-group-row">
                   <button
                     class="computer-group-toggle"
                     title={section.name}
                     aria-expanded={!collapsedGroups[sectionKey]}
-                    onclick={() => (collapsedGroups[sectionKey] = !collapsedGroups[sectionKey])}
+                    data-order-handle
+                    aria-keyshortcuts="Alt+ArrowUp Alt+ArrowDown"
+                    {...headingHandlers(section.name)}
+                    onclick={(event) => {
+                      if (!heldHeading(event))
+                        collapsedGroups[sectionKey] = !collapsedGroups[sectionKey];
+                    }}
                     ><Laptop size={13} /><span>{section.name}</span
                     >{#if !computerOnline(section.id)}<small class="computer-offline">Offline</small
                       >{/if}<ChevronRight
@@ -7581,13 +7705,23 @@
                 </div>{/if}
               {#if !collapsedGroups[sectionKey]}{#each section.folders as folder}
                   {@const folderKey = `${sectionKey}/${folder.id}`}
-                  <div class="conversation-folder" aria-label={folder.detail}>
+                  <div
+                    class="conversation-folder"
+                    aria-label={folder.detail}
+                    data-order={folder.id}
+                  >
                     <div class="folder-group-row">
                       <button
                         class="folder-group-toggle"
                         title={folder.detail}
                         aria-expanded={!collapsedGroups[folderKey]}
-                        onclick={() => (collapsedGroups[folderKey] = !collapsedGroups[folderKey])}
+                        data-order-handle
+                        aria-keyshortcuts="Alt+ArrowUp Alt+ArrowDown"
+                        {...headingHandlers(folder.name)}
+                        onclick={(event) => {
+                          if (!heldHeading(event))
+                            collapsedGroups[folderKey] = !collapsedGroups[folderKey];
+                        }}
                         >{#if folder.location?.path}<FolderIcon
                             icon={folderIconOf(iconsByFolder, folder.location)?.icon}
                             size={14}
@@ -7614,7 +7748,10 @@
                         ><Plus size={14} /></button
                       >
                     </div>
-                    {#if !collapsedGroups[folderKey]}<div class="folder-conversations">
+                    {#if !collapsedGroups[folderKey]}<div
+                        class="folder-conversations"
+                        data-order-space="chats"
+                      >
                         {#each folder.scratches as s (s.id)}{@const current =
                             !activeId && scratchId === s.id && view === 'chat'}
                           <div class="conversation-row">
@@ -8819,6 +8956,7 @@
       snoozeDisabled={conversationRunning(menuConversation)}
       pin={pinFromMenu}
       pinned={pinsByChat.has(menuConversation.id)}
+      {...menuMoves(conversationMenu.order, () => closeConversationMenu())}
     />
   {/key}
 {:else if conversationMenu && menuScratch}
@@ -8831,6 +8969,18 @@
       close={closeConversationMenu}
       remove={requestScratchDiscard}
       removeLabel="Discard draft"
+    />
+  {/key}
+{/if}
+{#if headingMenu}
+  {#key headingMenu}
+    <ConversationContextMenu
+      x={headingMenu.x}
+      y={headingMenu.y}
+      name={headingMenu.name}
+      trigger={headingMenu.trigger}
+      close={closeHeadingMenu}
+      {...menuMoves(headingMenu.order, () => closeHeadingMenu())}
     />
   {/key}
 {/if}

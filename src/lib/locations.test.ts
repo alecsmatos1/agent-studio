@@ -20,6 +20,7 @@ import {
 } from './locations';
 import { emptyShared, mergeShared, sharedWorkspace } from './sync';
 import { sessionTimeline } from './app-sessions';
+import { orderIndex, withMove, type SidebarOrder } from './sidebar-order';
 
 function fixture() {
   const workspace = initialWorkspace();
@@ -686,6 +687,126 @@ describe('computer and folder chat scope', () => {
     expect(next('pinned history')).toBeUndefined();
     // Without pins, nothing is pinned.
     expect(groupConversations(conversations, workspace.fleet, installation)[0].pinned).toEqual([]);
+  });
+  it('keeps chats, pinned chats, folders and computers where the reader placed them', () => {
+    const { workspace, installation, location } = fixture();
+    ensureLocationConnections(workspace.fleet, location);
+    const chat = (title: string, place = location, archived = false): Conversation => ({
+      id: title,
+      settings: settingsFor(workspace.preferences),
+      location: place,
+      title,
+      createdAt: '',
+      updatedAt: '',
+      messages: [],
+      ...(archived ? { archived } : {}),
+    });
+    const other = { ...location, path: '/home/test/other' };
+    const drafts = { ...location, path: '/home/test/drafts' };
+    const standalone = {
+      computerId: installation.computerId,
+      environmentId: installation.id,
+      path: '',
+    };
+    // The most recently used first, as the sidebar hands them over.
+    const conversations = [
+      chat('a'),
+      chat('b'),
+      chat('c'),
+      chat('other chat', other),
+      chat('standalone', standalone),
+      chat('pinned one'),
+      chat('pinned two'),
+      chat('history a', location, true),
+      chat('history b', location, true),
+      chat('history other', other, true),
+    ];
+    const pins = new Map([
+      ['pinned one', { at: '2026-11-01T09:00:00.000Z' }],
+      ['pinned two', { at: '2026-11-01T10:00:00.000Z' }],
+    ]);
+    const scratch = { id: 'draft', computerId: installation.computerId, location: drafts };
+    const listed = (order?: SidebarOrder, chats = conversations) =>
+      groupConversations(
+        chats,
+        workspace.fleet,
+        installation,
+        [scratch],
+        [],
+        Date.now(),
+        pins,
+        orderIndex(order),
+      );
+    const shown = (groups: ReturnType<typeof listed>) => ({
+      pinned: groups[0].pinned.map((p) => p.conversation.id),
+      active: groups[0].sections.map((s): [string, string[][]] => [
+        s.id,
+        s.folders.map((f) => [f.name, ...f.conversations.map((c) => c.id)]),
+      ]),
+      history: groups[1].sections.flatMap((s) =>
+        s.folders.map((f) => [f.name, ...f.conversations.map((c) => c.id)]),
+      ),
+    });
+    const before = listed();
+    const [wsl, desktop] = before[0].sections.map((s) => s.id);
+    const folders = before[0].sections[0].folders.map((f) => f.id);
+    expect(shown(before)).toEqual({
+      pinned: ['pinned two', 'pinned one'],
+      active: [
+        [wsl, [['project', 'a', 'b', 'c'], ['other', 'other chat'], ['drafts']]],
+        [desktop, [['Standalone', 'standalone']]],
+      ],
+      history: [
+        ['project', 'history a', 'history b'],
+        ['other', 'history other'],
+      ],
+    });
+    // Each list keeps the places its moves give it.
+    let order = withMove(undefined, 'chats', ['a', 'b', 'c'], 'c', 0);
+    order = withMove(order, 'pinned', ['pinned two', 'pinned one'], 'pinned one', 0);
+    order = withMove(order, 'folders', folders.slice(0, 2), folders[1], 0);
+    order = withMove(order, 'computers', [wsl, desktop], desktop, 0);
+    order = withMove(order, 'chats', ['history a', 'history b'], 'history b', 0);
+    const after = listed(order);
+    // A folder holding only a draft follows the folders placed before it.
+    expect(shown(after)).toEqual({
+      pinned: ['pinned one', 'pinned two'],
+      active: [
+        [desktop, [['Standalone', 'standalone']]],
+        [wsl, [['other', 'other chat'], ['project', 'c', 'a', 'b'], ['drafts']]],
+      ],
+      history: [
+        ['other', 'history other'],
+        ['project', 'history b', 'history a'],
+      ],
+    });
+    // A chat never placed comes first in its folder, whatever the places of the others.
+    expect(shown(listed(order, [chat('new'), ...conversations])).active[1][1][1]).toEqual([
+      'project',
+      'new',
+      'c',
+      'a',
+      'b',
+    ]);
+    // Placed, the draft's folder keeps its place too.
+    const placed = withMove(
+      order,
+      'folders',
+      [folders[1], folders[0], locationKey(drafts)],
+      locationKey(drafts),
+      0,
+    );
+    expect(shown(listed(placed)).active[1][1].map((f) => f[0])).toEqual([
+      'drafts',
+      'other',
+      'project',
+    ]);
+    // Leaving Active, a chat gives way to the chat listed below it as placed.
+    const next = (id: string) => nextActiveConversation(after, id)?.id;
+    expect(next('c')).toBe('a');
+    expect(next('b')).toBe('a');
+    expect(next('pinned one')).toBe('pinned two');
+    expect(next('pinned two')).toBe('c');
   });
 
   it('syncs archiving and never loses a concurrent location or history edit during run reconciliation', () => {

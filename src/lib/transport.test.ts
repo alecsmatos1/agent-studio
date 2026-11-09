@@ -1970,6 +1970,79 @@ it('keeps pins that an older relay drops, and sends them to a relay that keeps t
   await transport.disconnectRelay();
 });
 
+it("keeps the sidebar's order when an older relay drops it, and sends it to one that keeps it", async () => {
+  const { transport, workspace, relay, local, apply, polls } = await settledRelay();
+  const keeps = native.invoke.getMockImplementation()!;
+  // An older relay's schema drops the list from every save.
+  let older = true;
+  native.invoke.mockImplementation(async (command, args) =>
+    keeps(
+      command,
+      older && command === 'relay_request' && args.path === 'v1/state' && args.method === 'PUT'
+        ? {
+            ...args,
+            body: {
+              ...args.body,
+              workspace: { ...args.body.workspace, sidebarOrder: undefined },
+            },
+          }
+        : args,
+    ),
+  );
+  const { withMove, withoutRanks } = await import('./sidebar-order');
+  const placed = withMove(undefined, 'folders', ['one', 'two'], 'two', 0, new Date(2026, 10, 9));
+  workspace.sidebarOrder = placed;
+  local.changes++;
+  // With only the list changed, there is nothing to send to a relay without one.
+  expect((await polls(1)).state).toEqual(['GET v1/state/revision']);
+  // The next change carries it, and the relay drops it again.
+  workspace.conversations[0].title = 'Renamed here';
+  local.changes++;
+  later();
+  expect((await polls(1)).state).toEqual([
+    'GET v1/state/revision',
+    'PUT v1/state',
+    'save_sync_state',
+  ]);
+  expect(relay.workspace.sidebarOrder).toBeUndefined();
+  expect((await polls(2)).state).toEqual(Array(2).fill('GET v1/state/revision'));
+  // A change from another device leaves the order here.
+  relay.workspace = structuredClone(relay.workspace);
+  relay.workspace.conversations[0].title = 'Renamed elsewhere';
+  relay.revision++;
+  later();
+  await polls(1);
+  expect(workspace.conversations[0].title).toBe('Renamed elsewhere');
+  expect(workspace.sidebarOrder).toEqual(placed);
+  expect(apply).toHaveBeenCalledOnce();
+  expect((await polls(2)).state).toEqual(Array(2).fill('GET v1/state/revision'));
+  // Once the relay keeps the order, the next change takes it there, and a forgotten place goes
+  // by itself.
+  older = false;
+  workspace.conversations[0].title = 'Renamed again';
+  local.changes++;
+  later();
+  expect((await polls(1)).state).toEqual([
+    'GET v1/state/revision',
+    'PUT v1/state',
+    'save_sync_state',
+  ]);
+  expect(relay.workspace.sidebarOrder).toEqual(placed);
+  workspace.sidebarOrder = withoutRanks(placed, 'folders', ['two']);
+  local.changes++;
+  later();
+  expect((await polls(1)).state).toEqual([
+    'GET v1/state/revision',
+    'PUT v1/state',
+    'save_sync_state',
+  ]);
+  expect(relay.workspace.sidebarOrder).toEqual({
+    folders: [placed!.folders![0]],
+  });
+  expect((await polls(2)).state).toEqual(Array(2).fill('GET v1/state/revision'));
+  await transport.disconnectRelay();
+});
+
 it('routes requests and account updates with the fleet alone, never a workspace copy', async () => {
   const { transport, relay, local, polls, here, there, peer } = await settledRelay();
   const reads = local.reads;

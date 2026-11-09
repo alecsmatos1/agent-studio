@@ -22,6 +22,7 @@ import {
   type AppSession,
   type SessionTimeline,
 } from './app-sessions';
+import { arranged, orderIndex, type OrderIndex } from './sidebar-order';
 
 export const locationKey = (location: ChatLocation) =>
   `${location.computerId}/${locationExecutionId(location)}/${location.environmentId}/${location.path}`;
@@ -324,10 +325,26 @@ export type PinnedChat = {
   // Its folder group's id, so the chat opened after it leaves Active stays in that folder.
   folderId: string;
 };
+// Folders and computers as the reader placed them. Those never placed come first, in their own
+// order, except those holding only unsent drafts, which follow the rest until they are placed.
+function placed<T>(
+  items: T[],
+  ranks: ReadonlyMap<string, string>,
+  id: (item: T) => string,
+  draftsOnly: (item: T) => boolean,
+) {
+  if (!ranks.size) return items;
+  const last = items.filter((item) => draftsOnly(item) && !ranks.has(id(item)));
+  if (!last.length) return arranged(items, ranks, id);
+  const rest = items.filter((item) => !last.includes(item));
+  return [...arranged(rest, ranks, id), ...last];
+}
 // Active conversations by computer and folder, and History ones by app session and folder.
 // Scratch chats, new conversations not sent yet, are listed in Active only: first in their
 // folder, and in folders of their own after the folders that hold conversations. Pinned chats
-// lead the tab they are in, the most recently pinned first, instead of their folder.
+// lead the tab they are in, the most recently pinned first, instead of their folder. Chats,
+// pinned chats, folders and computers the reader moved keep the places `order` gives them
+// (src/lib/sidebar-order.ts), after those never moved.
 export function groupConversations<S extends { computerId: string; location?: ChatLocation }>(
   conversations: Conversation[],
   fleet: Fleet,
@@ -336,6 +353,7 @@ export function groupConversations<S extends { computerId: string; location?: Ch
   appSessions: AppSession[] = [],
   now = Date.now(),
   pins: ReadonlyMap<string, { at: string }> = new Map(),
+  order: OrderIndex = orderIndex(),
 ) {
   const views = computerViews(fleet);
   const computerName = (id: string) =>
@@ -378,20 +396,30 @@ export function groupConversations<S extends { computerId: string; location?: Ch
     return folderIn(computer.folders, location);
   };
   const pinnedIn = (listed: Conversation[]): PinnedChat[] =>
-    listed
-      .filter((c) => pins.has(c.id))
-      .map((conversation) => {
-        const location = conversationLocation(conversation, fleet, installation);
-        return {
-          conversation,
-          location,
-          folderId: location ? locationKey(location) : 'unassigned',
-        };
-      })
-      .sort(
-        (a, b) =>
-          Date.parse(pins.get(b.conversation.id)!.at) - Date.parse(pins.get(a.conversation.id)!.at),
-      );
+    arranged(
+      listed
+        .filter((c) => pins.has(c.id))
+        .map((conversation) => {
+          const location = conversationLocation(conversation, fleet, installation);
+          return {
+            conversation,
+            location,
+            folderId: location ? locationKey(location) : 'unassigned',
+          };
+        })
+        .sort(
+          (a, b) =>
+            Date.parse(pins.get(b.conversation.id)!.at) -
+            Date.parse(pins.get(a.conversation.id)!.at),
+        ),
+      order.pinned,
+      (pinned) => pinned.conversation.id,
+    );
+  // A folder's chats as the reader placed them.
+  const folderList = (folder: FolderGroup<S>): FolderGroup<S> =>
+    order.chats.size
+      ? { ...folder, conversations: arranged(folder.conversations, order.chats, (c) => c.id) }
+      : folder;
   const active = conversations.filter((c) => !c.archived);
   for (const conversation of active)
     if (!pins.has(conversation.id))
@@ -453,17 +481,25 @@ export function groupConversations<S extends { computerId: string; location?: Ch
         sectionOf(conversation).folders,
         conversationLocation(conversation, fleet, installation),
       ).conversations.push(conversation);
+  const draftsOnly = (folder: FolderGroup<S>) => !folder.conversations.length;
   return [
     {
       id: 'active',
       name: 'Active',
       count: active.length,
       pinned: pinnedIn(active),
-      sections: [...computers.values()].map((c): ConversationSection<S> => ({
+      sections: placed(
+        [...computers.values()],
+        order.computers,
+        (c) => c.id,
+        (c) => [...c.folders.values()].every(draftsOnly),
+      ).map((c): ConversationSection<S> => ({
         kind: 'computer',
         id: c.id,
         name: c.name,
-        folders: [...c.folders.values()],
+        folders: placed([...c.folders.values()], order.folders, (f) => f.id, draftsOnly).map(
+          folderList,
+        ),
       })),
     },
     {
@@ -474,11 +510,11 @@ export function groupConversations<S extends { computerId: string; location?: Ch
       sections: [...sections.values()]
         .sort((a, b) => b.at - a.at)
         .map(({ at, folders, ...section }): ConversationSection<S> => {
-          const listed = [...folders.values()];
+          const listed = arranged([...folders.values()], order.folders, (f) => f.id);
           return {
             ...section,
             computers: new Set(listed.map((f) => f.computerId)).size,
-            folders: listed,
+            folders: listed.map(folderList),
           };
         }),
     },

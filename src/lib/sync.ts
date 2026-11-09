@@ -28,6 +28,7 @@ import { mergeFolderIcons, sameFolderIcons } from './folder-icons.ts';
 import { mergeAccountColors, sameAccountColors } from './account-colors.ts';
 import { mergeSnoozes, sameSnoozes } from './snoozes.ts';
 import { mergePins, samePins } from './pins.ts';
+import { mergeSidebarOrder, sameSidebarOrder } from './sidebar-order.ts';
 import { jsonEqual } from './json-equal.ts';
 
 export type SharedWorkspace = Pick<
@@ -42,6 +43,7 @@ export type SharedWorkspace = Pick<
   | 'accountColors'
   | 'snoozes'
   | 'pins'
+  | 'sidebarOrder'
 >;
 export const sharedSchema = workspaceSchema.pick({
   fleet: true,
@@ -54,6 +56,7 @@ export const sharedSchema = workspaceSchema.pick({
   accountColors: true,
   snoozes: true,
   pins: true,
+  sidebarOrder: true,
 });
 /** One conversation as replicated, so a sync can validate and compare it by itself. */
 export const sharedChatSchema = sharedSchema.shape.conversations.element;
@@ -66,6 +69,15 @@ export const metaOf = (workspace: SharedWorkspace): SharedMeta => {
   const { conversations, ...meta } = workspace;
   return meta;
 };
+/**
+ * Gives the workspace the replicated settings a sync received, every field the shared schema
+ * lists, so a setting added later is never left out. Received pins were left out until
+ * 2026-11-09: other devices never showed them, and the next merge here took them away everywhere.
+ */
+export function applySharedMeta(workspace: Workspace, meta: SharedMeta | SharedWorkspace) {
+  for (const key of Object.keys(sharedMetaSchema.shape) as (keyof SharedMeta)[])
+    (workspace as Record<string, unknown>)[key] = meta[key];
+}
 export type MergeOptions = {
   /**
    * Reports whether this device is the execution host of the run that produced `message`
@@ -102,8 +114,8 @@ const same = <T extends { id: string }>(x?: T[], y?: T[]) => equal(byId(x), byId
 /**
  * Whether two shared workspaces hold the same data. Lists compare by item id: this device
  * adds new chats at the front, while a merge keeps its base order and appends them. App sessions,
- * folder icons, account colors, snoozes and pins compare only when `a`, the relay's copy, holds
- * them: an older relay drops them, and this device keeps its own.
+ * folder icons, account colors, snoozes, pins and the sidebar's order compare only when `a`, the
+ * relay's copy, holds them: an older relay drops them, and this device keeps its own.
  */
 export function sameShared(a: SharedWorkspace, b: SharedWorkspace): boolean {
   return (
@@ -119,7 +131,8 @@ export function sameShared(a: SharedWorkspace, b: SharedWorkspace): boolean {
     (!a.folderIcons || sameFolderIcons(a.folderIcons, b.folderIcons)) &&
     (!a.accountColors || sameAccountColors(a.accountColors, b.accountColors)) &&
     (!a.snoozes || sameSnoozes(a.snoozes, b.snoozes)) &&
-    (!a.pins || samePins(a.pins, b.pins))
+    (!a.pins || samePins(a.pins, b.pins)) &&
+    (!a.sidebarOrder || sameSidebarOrder(a.sidebarOrder, b.sidebarOrder))
   );
 }
 /**
@@ -142,7 +155,8 @@ export function sameMeta(a: SharedMeta, b: SharedMeta): boolean {
     sameFolderIcons(a.folderIcons, b.folderIcons) &&
     sameAccountColors(a.accountColors, b.accountColors) &&
     sameSnoozes(a.snoozes, b.snoozes) &&
-    samePins(a.pins, b.pins)
+    samePins(a.pins, b.pins) &&
+    sameSidebarOrder(a.sidebarOrder, b.sidebarOrder)
   );
 }
 
@@ -700,6 +714,9 @@ export function mergeShared(
     ),
     ...snoozesField(mergeSnoozes(base.snoozes, local.snoozes, remote.snoozes)),
     ...pinsField(mergePins(base.pins, local.pins, remote.pins)),
+    ...sidebarOrderField(
+      mergeSidebarOrder(base.sidebarOrder, local.sidebarOrder, remote.sidebarOrder),
+    ),
   };
 }
 // An absent value follows the default text, so it stays absent rather than undefined.
@@ -714,6 +731,8 @@ const accountColorsField = (value: SharedWorkspace['accountColors']) =>
 const snoozesField = (value: SharedWorkspace['snoozes']) =>
   value === undefined ? {} : { snoozes: value };
 const pinsField = (value: SharedWorkspace['pins']) => (value === undefined ? {} : { pins: value });
+const sidebarOrderField = (value: SharedWorkspace['sidebarOrder']) =>
+  value === undefined ? {} : { sidebarOrder: value };
 export type Presence = {
   accountUpdates?: import('./live-usage').AccountUpdate[];
   /**

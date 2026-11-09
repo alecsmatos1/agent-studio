@@ -1134,6 +1134,34 @@ pre {
   gap: 1px;
   margin: 1px 0 4px;
 }
+/* A chat, folder or computer moved by hand rides above its list on the overlay surface while the
+   rest of its list slides to make room, then glides into its place (src/lib/reorder.ts). Only
+   transforms move, so the list's layout never changes during a drag. A root class keeps the
+   cursor rule cheap for every other style recalculation. */
+:root.sidebar-reordering,
+:root.sidebar-reordering * {
+  cursor: grabbing !important;
+  user-select: none !important;
+}
+:root.sidebar-reordering iframe {
+  pointer-events: none;
+}
+.order-moving > [data-order] {
+  transition: transform var(--duration) var(--ease-out);
+}
+.order-moving > .order-lifted {
+  position: relative;
+  z-index: 1;
+  border-radius: var(--radius-sm);
+  background: var(--surface-overlay);
+  box-shadow:
+    0 0 0 1px var(--border-strong),
+    var(--shadow-md);
+  transition: none;
+}
+.order-moving > .order-lifted.order-landing {
+  transition: transform var(--duration-fast) var(--ease-out);
+}
 .conversation-list .conversation-item,
 .workflow-list .conversation-item,
 .conversation-list .scratch-item {

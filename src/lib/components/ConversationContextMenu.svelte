@@ -1,6 +1,15 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import { AlarmClock, AlarmClockOff, GitFork, Pin, PinOff, Trash2 } from '@lucide/svelte';
+  import {
+    AlarmClock,
+    AlarmClockOff,
+    ArrowDown,
+    ArrowUp,
+    GitFork,
+    Pin,
+    PinOff,
+    Trash2,
+  } from '@lucide/svelte';
 
   let {
     x,
@@ -17,13 +26,16 @@
     snoozeDisabled = false,
     pin,
     pinned = false,
+    moveUp,
+    moveDown,
   }: {
     x: number;
     y: number;
     name: string;
     trigger: HTMLElement;
     close: (restoreFocus?: boolean) => void;
-    remove: () => void;
+    // A folder's or computer's menu has nothing to delete.
+    remove?: () => void;
     removeLabel?: string;
     // Scratch chats have nothing to fork.
     fork?: () => void;
@@ -35,6 +47,9 @@
     // Pins the chat to the top of its tab, or unpins it when `pinned`.
     pin?: (event: MouseEvent) => void;
     pinned?: boolean;
+    // Moves the item one place within its list: offered on touch screens, where nothing is dragged.
+    moveUp?: (event: MouseEvent) => void;
+    moveDown?: (event: MouseEvent) => void;
   } = $props();
   let menu: HTMLDivElement;
 
@@ -133,9 +148,15 @@
           aria-hidden="true"
         />Pin{/if}</button
     >{/if}
-  <button class="danger" type="button" role="menuitem" tabindex="-1" onclick={remove}
-    ><Trash2 size={15} aria-hidden="true" />{removeLabel}</button
-  >
+  {#if moveUp}<button type="button" role="menuitem" tabindex="-1" onclick={moveUp}
+      ><ArrowUp size={15} aria-hidden="true" />Move up</button
+    >{/if}
+  {#if moveDown}<button type="button" role="menuitem" tabindex="-1" onclick={moveDown}
+      ><ArrowDown size={15} aria-hidden="true" />Move down</button
+    >{/if}
+  {#if remove}<button class="danger" type="button" role="menuitem" tabindex="-1" onclick={remove}
+      ><Trash2 size={15} aria-hidden="true" />{removeLabel}</button
+    >{/if}
 </div>
 
 <style>

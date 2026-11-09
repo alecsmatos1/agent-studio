@@ -42,6 +42,7 @@ import { folderIconsSchema } from './folder-icons.ts';
 import { accountColorsSchema } from './account-colors.ts';
 import { snoozesSchema } from './snoozes.ts';
 import { pinsSchema } from './pins.ts';
+import { sidebarOrderSchema } from './sidebar-order.ts';
 import {
   workflowSchema,
   workflowProgressSchema,
@@ -354,6 +355,8 @@ export const workspaceSchema = z.object({
   snoozes: snoozesSchema.optional(),
   // Chats pinned to the top of the Active or History tab they are in.
   pins: pinsSchema.optional(),
+  // The order the reader gave the sidebar's chats, folders and computers.
+  sidebarOrder: sidebarOrderSchema.optional(),
 });
 export type Workspace = z.infer<typeof workspaceSchema>;
 export type ProviderStatus = {
