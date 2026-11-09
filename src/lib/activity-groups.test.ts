@@ -7,6 +7,7 @@ import {
   closingComment,
   groupActivityEntries,
   groupIcon,
+  isFailure,
   liveAction,
   liveGroupItems,
   liveMemory,
@@ -564,22 +565,86 @@ describe('activity groups', () => {
     const running = tool('run', { name: 'Run command', status: 'running' });
     expect(activityGroupSummary([failed, running], 'running')).toMatchObject({
       label: 'Edits to 1 file and 1 command',
+      parts: [{ text: 'Edits to 1 file', failed: 'error' }, { text: ' and 1 command' }],
       running: true,
       issue: 'error',
+      unfinished: undefined,
     });
     expect(
       activityGroupSummary([tool('read', { status: 'error' }), tool('again')], 'complete').label,
     ).toBe('Reads of 2 files');
     expect(activityGroupSummary([running], 'complete')).toMatchObject({
       label: '1 command',
+      parts: [{ text: '1 command' }],
       running: false,
       issue: 'unknown',
+      unfinished: 'unknown',
     });
     expect(activityGroupSummary([running], 'cancelled')).toMatchObject({
       label: '1 command',
+      parts: [{ text: '1 command' }],
       running: false,
       issue: 'cancelled',
+      unfinished: 'cancelled',
     });
+  });
+
+  it('sets apart the words of each action whose calls failed or were blocked', () => {
+    const read = (id: string, path: string) => tool(id, { operation: 'read', path });
+    const command = (id: string, status: ToolActivity['status'] = 'complete') =>
+      tool(id, { name: 'Run command', commandRun: true, status });
+    const edit = tool('edit', { name: 'Edit', operation: 'edit', status: 'error' });
+    // One of two commands failed: only the commands' words are set apart.
+    const calls = [
+      read('a', 'a.ts'),
+      command('lint', 'error'),
+      command('test'),
+      read('b', 'b.ts'),
+      tool('other', { name: 'Unknown tool' }),
+    ];
+    expect(activityGroupSummary(calls, 'complete')).toMatchObject({
+      label: 'Reads of 2 files, 2 commands, and 1 tool',
+      parts: [
+        { text: 'Reads of 2 files, ' },
+        { text: '2 commands', failed: 'error' },
+        { text: ', and 1 tool' },
+      ],
+      issue: 'error',
+      unfinished: undefined,
+      childIssue: undefined,
+    });
+    // A failed first action keeps its capital; a blocked one is set apart too.
+    expect(
+      activityGroupSummary([edit, read('a', 'a.ts'), command('push', 'blocked')], 'complete').parts,
+    ).toEqual([
+      { text: 'Edits to 1 file', failed: 'error' },
+      { text: ', reads of 1 file, and ' },
+      { text: '1 command', failed: 'blocked' },
+    ]);
+    // A kind with both failed and blocked calls reads as failed.
+    expect(
+      activityGroupSummary([command('push', 'blocked'), command('lint', 'error')], 'complete')
+        .parts,
+    ).toEqual([{ text: '2 commands', failed: 'error' }]);
+    // A stop beside a failure is still reported beside the label.
+    expect(
+      activityGroupSummary([command('lint', 'error'), command('dev', 'running')], 'cancelled'),
+    ).toMatchObject({
+      label: '2 commands',
+      parts: [{ text: '2 commands', failed: 'error' }],
+      issue: 'error',
+      unfinished: 'cancelled',
+    });
+    // Nothing failed: one plain run.
+    expect(activityGroupSummary(calls.slice(2), 'complete').parts).toEqual([
+      { text: 'Ran 1 command, read 1 file, and used 1 tool' },
+    ]);
+    expect(activityGroupSummary([], 'complete')).toMatchObject({ label: '', parts: [] });
+    expect([isFailure('error'), isFailure('blocked'), isFailure('cancelled')]).toEqual([
+      true,
+      true,
+      false,
+    ]);
   });
 
   it('reads background launches as started work that never spins the group', () => {
@@ -848,7 +913,9 @@ describe('activity groups', () => {
     });
     expect(activityGroupSummary([parent], 'complete')).toMatchObject({
       label: '1 sub-agent',
+      parts: [{ text: '1 sub-agent' }],
       issue: 'unknown',
+      unfinished: 'unknown',
       running: false,
     });
     // A sub-agent that carried on past failed calls finished; its group counts the failures.
@@ -860,7 +927,9 @@ describe('activity groups', () => {
     const summary = activityGroupSummary([parent], 'complete', [parent, ...failed, stopped]);
     expect(summary).toMatchObject({
       label: 'Worked with 1 sub-agent',
+      parts: [{ text: 'Worked with 1 sub-agent' }],
       issue: undefined,
+      unfinished: undefined,
       childIssue: { status: 'error', count: 2 },
       running: false,
     });
@@ -870,6 +939,7 @@ describe('activity groups', () => {
     parent.agents[0].status = 'error';
     expect(activityGroupSummary([parent], 'complete', [parent, ...failed])).toMatchObject({
       label: '1 sub-agent',
+      parts: [{ text: '1 sub-agent', failed: 'error' }],
       issue: 'error',
       childIssue: undefined,
     });

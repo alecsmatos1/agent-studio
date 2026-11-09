@@ -223,16 +223,33 @@ test('failed and unfinished calls keep a truthful row until they fold', async ({
   await expect(rows.first().locator('.live-verb')).toHaveText('Command');
   await expect(rows.first().locator('.live-status')).toContainText('Failed');
   await emit(page, call('web', { category: 'search', name: 'Web search', query: 'svelte flip' }));
-  await expect(page.locator('.activity-group > summary')).toContainText('1 command');
-  await expect(page.locator('.activity-group > summary')).toContainText('Failed');
+  // The failed command's words are red, with no outcome beside them.
+  const summary = page.locator('.activity-group > summary');
+  await expect(summary.locator('.failed-part')).toHaveText('1 command');
+  await expect(summary.locator('.tool-status')).toHaveCount(0);
+  await expect(summary).toMatchAriaSnapshot('- text: 1 command failed');
+  const colors = await summary.evaluate((row) => {
+    const part = row.querySelector('.failed-part')!;
+    const danger = document.createElement('span');
+    danger.style.color = 'var(--danger)';
+    row.append(danger);
+    const color = (element: Element) => getComputedStyle(element).color;
+    const found = [color(part), color(danger), color(row)];
+    danger.remove();
+    return found;
+  });
+  expect(colors[0]).toBe(colors[1]);
+  expect(colors[0]).not.toBe(colors[2]);
   await expect(rows.first()).toContainText('Searching the web for');
   await expect(rows.first()).toContainText('svelte flip');
   await page.evaluate(() => (window as any).finishCapabilities('cancelled'));
   await expect(rows).toHaveCount(0);
   await page.getByLabel('Work history', { exact: true }).click();
-  await expect(page.locator('.activity-group > summary')).toContainText(
-    '1 command and 1 web search',
-  );
+  // The failed command is red; the web search the stop left unfinished is marked beside it.
+  const history = page.locator('.activity-group > summary');
+  await expect(history).toContainText('1 command failed and 1 web search');
+  await expect(history.locator('.failed-part')).toHaveText('1 command');
+  await expect(history.locator('.tool-status')).toHaveText('Stopped');
 });
 
 test('folding rows keep a followed chat in place until new content fills the space', async ({

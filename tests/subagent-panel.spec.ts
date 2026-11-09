@@ -239,6 +239,10 @@ test('a sub-agent that carried on past failed calls reads as done, with its fail
   await expect(group.locator(':scope > summary')).toHaveText(
     /^\s*Worked with 1 sub-agent\s*2 calls failed\s*$/,
   );
+  // Its calls' failures are red beside the label, without an icon; the sub-agent itself is not.
+  await expect(group.locator(':scope > summary .tool-status.failed')).toHaveText('2 calls failed');
+  await expect(group.locator(':scope > summary .tool-status svg')).toHaveCount(0);
+  await expect(group.locator(':scope > summary .failed-part')).toHaveCount(0);
   await group.locator(':scope > summary').click();
   await expect(group.locator('.subagent-row')).toHaveText([/Explore the auth flow.*Completed/]);
   await expect(page.locator('.timeline-note').last()).toHaveText(
@@ -296,7 +300,8 @@ test('sub-agents in Work history open their saved conversation', async ({ page }
   // Work history lists each sub-agent as a row of its own group, with its task and outcome.
   await page.getByLabel('Work history', { exact: true }).click();
   const group = page.locator('.activity-group').first();
-  await expect(group.locator(':scope > summary')).toHaveText(/^\s*2 sub-agents\s*Failed\s*$/);
+  await expect(group.locator(':scope > summary')).toHaveText(/^\s*2 sub-agents failed\s*$/);
+  await expect(group.locator(':scope > summary .failed-part')).toHaveText('2 sub-agents');
   await group.locator(':scope > summary').click();
   const rows = group.locator('.subagent-row');
   await expect(rows).toHaveText([

@@ -1,5 +1,17 @@
 # Verification — 2026-09-08
 
+## The failed part of a tool group is red — 2026-11-09
+
+Requested 2026-11-09: "Can you show in red which part failed (only commands red, no icon or extra message) instead of showing a side icon failed?", with a row reading Commands beside a Failed mark with its icon.
+
+- `activityGroupSummary` (`src/lib/activity-groups.ts`) keeps each kind of action with the outcomes its calls came to and returns the label as `parts` as well as text: runs of plain words and, apart, the words of each action some of whose calls failed or were blocked (`failed`: `error`, or `blocked` when none failed). Separators and capitals are as before, so `label` is unchanged. It also returns `unfinished`, the stopped or unconfirmed outcome the row still shows beside its label; `issue`, which keeps choosing the nouns, and `childIssue` are unchanged.
+- `ToolActivity.svelte`: a group row renders the parts, the failed ones in `--danger` (`.failed-part`), each followed by a visually hidden " failed" or " blocked", and no longer marks a failure beside the label. Probed in Edge through the DevTools accessibility tree, the hidden word reads "2 commands failed , and ran 1 tool"; its leading space only keeps the row's text from reading "2 commandsfailed". A stopped or unconfirmed outcome keeps its mark (a stop beside a failure reads **4 commands** in red, then **Stopped**). A sub-agent that carried on past failed calls keeps **2 calls failed** beside its label in red, now without the icon, since no words of the label name those calls; a sub-agent that failed itself reads **1 sub-agent** in red. Calls inside an expanded group, live rows and sub-agent rows keep their own outcome marks.
+- Unit: `activity-groups.test.ts` (one of two commands failed among reads and a tool, a failed first action keeping its capital, a blocked action, a kind with both failed and blocked calls, a stop beside a failure, nothing failed, an empty group, `isFailure`; parts and `unfinished` added to the existing outcome and sub-agent cases), `hooks.test.ts` (a blocked hook).
+- Browser: `work-history.spec.ts` (only **1 command** red in saved history, no mark), `live-activity.spec.ts` (the folded failed command red in `--danger`, unlike the row's own colour, read as "1 command failed"; after a stop, **Stopped** beside it), `hooks.spec.ts` ("1 hook blocked"), `subagent-panel.spec.ts` (**2 calls failed** without an icon, **2 sub-agents** red). A scratch spec captured both themes in Edge, hovered and not.
+- Pipeline: `npm run check` (0 errors and 0 warnings in 5,485 files), 951 Vitest tests in 115 files, the build, and all 504 browser tests in three shards, each passing whole at its first run. No Rust changed.
+- Not exercised: the native app, since the change is frontend only and ran in Edge, the engine of WebView2, and in WebKit for the specs tagged for it.
+- Choices of mine, not confirmed: the red covers the action's whole words with their count (**2 commands**, **Edits to 1 file**), and a whole kind turns red when any of its calls failed; blocked calls turn red like failed ones; stopped and unconfirmed outcomes keep their mark; a sub-agent's failed calls keep their words beside the label, red and without the icon.
+
 ## Chats, folders and computers can be reordered — 2026-11-09
 
 Requested 2026-11-09: "Allow to reorder chats including folders".

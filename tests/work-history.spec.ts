@@ -111,10 +111,13 @@ for (const mobile of [false, true])
     await page.getByLabel('Work history', { exact: true }).click();
     await expect(history.getByLabel('Filter activity')).toHaveCount(0);
     await expect(groups).toHaveCount(2);
+    // Only the failed command's words are red, with no outcome beside the label.
     await expect(groups.locator(':scope > summary')).toHaveText([
       'Read 3 files',
-      'Edits to 1 file and 1 command Failed',
+      'Edits to 1 file and 1 command failed',
     ]);
+    await expect(groups.locator('.failed-part')).toHaveText(['1 command']);
+    await expect(groups.locator(':scope > summary .tool-status')).toHaveCount(0);
     await expect(page.locator('.activity-group[open], .tool-card[open]')).toHaveCount(0);
     const sequence = () =>
       page
@@ -132,7 +135,7 @@ for (const mobile of [false, true])
       'I will check the source files.',
       'Read 3 files',
       'The source is ready. I will update it and run the checks.',
-      'Edits to 1 file and 1 command Failed',
+      'Edits to 1 file and 1 command failed',
     ]);
     await page
       .locator('.chat-scroll')

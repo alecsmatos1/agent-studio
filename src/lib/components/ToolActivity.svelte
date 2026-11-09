@@ -31,11 +31,13 @@
     childIssueLabel,
     groupActivityEntries,
     groupIcon,
+    isFailure,
     liveAction,
     liveGroupItems,
     liveMemory,
     type ActivityEntry,
     type ActivitySource,
+    type GroupLabelPart,
     type LiveGroupItem,
   } from '$lib/activity-groups';
   import { compactionLabel, compactionTokens, type Compaction } from '$lib/compaction';
@@ -114,6 +116,9 @@
     left: 'Left running',
   };
   const kindLabels = { added: 'Added', modified: 'Edited', deleted: 'Deleted', renamed: 'Renamed' };
+  // What assistive technology hears after the red words of a group's failed action, spaced from
+  // them so the row's text reads "2 commands failed".
+  const failureWords = { error: ' failed', blocked: ' blocked' };
   const entries = $derived(work ?? activityEntries(blocks, tools, finalText, compactions));
   // The reply's own comments show its artifacts as cards; a sub-agent's text keeps its code.
   const artifactCards = $derived<ArtifactCards | undefined>(
@@ -451,6 +456,14 @@
   </ul>
 {/snippet}
 
+<!-- A group's label, with the words of each action that failed in red and no outcome beside
+     them; assistive technology hears it after those words. -->
+{#snippet labelParts(parts: GroupLabelPart[])}
+  {#each parts as part}{#if part.failed}<span class="failed-part">{part.text}</span><span
+        class="sr-only">{failureWords[part.failed]}</span
+      >{:else}{part.text}{/if}{/each}
+{/snippet}
+
 <!-- `calls` are the group's own calls and those of its sub-agents; `counted` animates the label. -->
 {#snippet groupRow(key: string, visible: ToolActivity[], calls: ToolActivity[], counted = false)}
   {@const summary = activityGroupSummary(visible, replyStatus, tools)}
@@ -461,9 +474,10 @@
     <summary title="Expand for tool details" onclick={disclosures.reveal(key)}>
       {#if summary.running}<LoaderCircle size={16} class="spinning" aria-label="Running" />
       {:else}<ToolIcon icon={groupIcon(visible)} size={16} />{/if}
-      {#if counted}{#key summary.label}<span class="group-label counted">{summary.label}</span
+      {#if counted}{#key summary.label}<span class="group-label counted"
+            >{@render labelParts(summary.parts)}</span
           >{/key}
-      {:else}<span class="group-label">{summary.label}</span>{/if}
+      {:else}<span class="group-label">{@render labelParts(summary.parts)}</span>{/if}
       {#if summary.running && elapsed >= 0}<span class="group-progress">
           {#if progressTool}<span>{toolProgressLabel(progressTool)}</span>{/if}
           <span
@@ -473,8 +487,12 @@
             >{toolElapsed(elapsed)}</span
           >
         </span>{/if}
-      {#if summary.issue}{@render statusMark(summary.issue)}
-      {:else if summary.childIssue}{@render statusMark(
+      <!-- A failure shows in the label; a sub-agent's failed calls, which it carried on past, in
+           red beside it. -->
+      {#if summary.unfinished}{@render statusMark(summary.unfinished)}
+      {:else if summary.childIssue && isFailure(summary.childIssue.status)}<span
+          class="tool-status failed">{childIssueLabel(summary.childIssue)}</span
+        >{:else if summary.childIssue}{@render statusMark(
           summary.childIssue.status,
           childIssueLabel(summary.childIssue),
         )}{/if}
@@ -720,6 +738,10 @@
   .group-label {
     min-width: 0;
     overflow-wrap: anywhere;
+  }
+  /* The words of an action whose calls failed, in place of an outcome beside the label. */
+  .failed-part {
+    color: var(--danger);
   }
   .group-progress,
   .tool-state {

@@ -369,6 +369,18 @@ function callStatesByAgent(tools: ToolActivity[]) {
 
 const issues = ['error', 'blocked', 'cancelled', 'unknown'] as const;
 type Issue = (typeof issues)[number];
+const failures = ['error', 'blocked'] as const;
+/** An outcome a group's label shows in red on the words of the action it befell. */
+export type Failure = (typeof failures)[number];
+export const isFailure = (status: string): status is Failure =>
+  (failures as readonly string[]).includes(status);
+const unfinished = ['cancelled', 'unknown'] as const;
+
+/**
+ * A run of a group's label. `failed` marks the words of an action some of whose calls failed or
+ * were blocked, which the row shows in red instead of an outcome beside the label.
+ */
+export type GroupLabelPart = { text: string; failed?: Failure };
 
 /** How many of a group's sub-agent calls failed, stopped or have an unconfirmed outcome. */
 export function childIssueLabel({ status, count }: { status: Issue; count: number }) {
@@ -386,25 +398,27 @@ export function activityGroupSummary(
   replyStatus: Message['status'],
   allTools: ToolActivity[] = tools,
 ) {
-  const kinds = new Map<keyof typeof phrases, ToolActivity[]>();
+  // Each kind of action with its calls and the outcomes they came to.
+  const kinds = new Map<
+    keyof typeof phrases,
+    { calls: ToolActivity[]; statuses: Set<ActivityDisplayStatus> }
+  >();
   for (const tool of tools) {
     const kind = action(tool);
-    const calls = kinds.get(kind);
-    if (calls) calls.push(tool);
-    else kinds.set(kind, [tool]);
+    let found = kinds.get(kind);
+    if (!found)
+      kinds.set(kind, (found = { calls: [], statuses: new Set<ActivityDisplayStatus>() }));
+    found.calls.push(tool);
+    // A sub-agent group's own status only summarizes its agents.
+    for (const item of tool.agents.length ? tool.agents : [tool])
+      found.statuses.add(activityDisplayStatus(item, replyStatus));
   }
   const children = new Set(tools.flatMap((tool) => tool.agents.map((agent) => agent.id)));
   // A background sub-agent's own calls run in the background with it.
   const background = new Set(
     tools.flatMap((tool) => tool.agents.filter((a) => a.background).map((a) => a.id)),
   );
-  const statuses = tools
-    .flatMap((tool) => [
-      // A sub-agent group's own status only summarizes its agents.
-      ...(tool.agents.length ? [] : [tool]),
-      ...tool.agents,
-    ])
-    .map((item) => activityDisplayStatus(item, replyStatus));
+  const statuses = new Set([...kinds.values()].flatMap((kind) => [...kind.statuses]));
   // A sub-agent's own calls keep their outcomes apart: one that carried on past a failed
   // command shows how many of its calls failed, never that it failed itself.
   const childStates = callStatesByAgent(allTools);
@@ -420,25 +434,38 @@ export function activityGroupSummary(
       count: state.count,
     })),
   );
-  const running = statuses.includes('running') || childCalls.some((c) => c.status === 'running');
-  const issue = issues.find((status) => statuses.includes(status));
+  const running = statuses.has('running') || childCalls.some((c) => c.status === 'running');
+  const issue = issues.find((status) => statuses.has(status));
   const childIssue = issue ? undefined : issues.find((s) => childCalls.some((c) => c.status === s));
   // Nouns avoid claiming success for failed, stopped, or unconfirmed operations.
   const tense = issue ? 2 : running ? 1 : 0;
-  const descriptions = [...kinds].map(([kind, calls]) => {
+  const descriptions = [...kinds].map(([kind, found]): GroupLabelPart => {
     const [one, many, ...forms] = phrases[kind];
-    const total = count(kind, calls);
-    return forms[tense].replace('#', `${total} ${total === 1 ? one : many}`);
+    const total = count(kind, found.calls);
+    return {
+      text: forms[tense].replace('#', `${total} ${total === 1 ? one : many}`),
+      failed: failures.find((status) => found.statuses.has(status)),
+    };
   });
-  const text =
-    descriptions.length > 2
-      ? `${descriptions.slice(0, -1).join(', ')}, and ${descriptions.at(-1)}`
-      : descriptions.join(' and ');
+  // The descriptions joined as a sentence, with the words of each failed action apart.
+  const parts: GroupLabelPart[] = [];
+  const add = (text: string, failed?: Failure) => {
+    const last = parts.at(-1);
+    if (last && !last.failed && !failed) last.text += text;
+    else parts.push(failed ? { text, failed } : { text });
+  };
+  descriptions.forEach(({ text, failed }, i) => {
+    if (i) add(i < descriptions.length - 1 ? ', ' : descriptions.length > 2 ? ', and ' : ' and ');
+    add(i ? text : text.charAt(0).toUpperCase() + text.slice(1), failed);
+  });
   return {
-    label: text.charAt(0).toUpperCase() + text.slice(1),
+    label: parts.map((part) => part.text).join(''),
+    parts,
     icon: [...kinds.keys()][0] ?? 'tool',
     running,
     issue,
+    // A stopped or unconfirmed outcome, which the row shows beside its label.
+    unfinished: unfinished.find((status) => statuses.has(status)),
     childIssue: childIssue && {
       status: childIssue,
       count: childCalls.reduce((sum, c) => sum + (c.status === childIssue ? c.count : 0), 0),

@@ -66,7 +66,9 @@ it('retains hook revisions and blocked outcomes through checkpoint, sync and exp
   expect(checkpoint[0].tool?.status).toBe('blocked');
   expect(activityGroupSummary([hook(3, 'blocked')], 'complete')).toMatchObject({
     label: '1 hook',
+    parts: [{ text: '1 hook', failed: 'blocked' }],
     issue: 'blocked',
+    unfinished: undefined,
   });
   expect(activityGroupSummary([hook(1, 'running')], 'running').label).toBe('Running 1 hook');
   expect(activityGroupSummary([hook(2, 'complete')], 'complete').label).toBe('Ran 1 hook');

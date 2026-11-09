@@ -101,8 +101,10 @@ for (const mobile of [false, true]) {
     await page.getByRole('tab', { name: /History/ }).click();
     await page.locator('.conversation-item').first().click();
     await page.getByLabel('Work history', { exact: true }).click();
-    await expect(page.locator('.activity-group').last().locator(':scope > summary')).toContainText(
-      'Blocked',
-    );
+    // The blocked hook's words are red, with no outcome beside them.
+    const summary = page.locator('.activity-group').last().locator(':scope > summary');
+    await expect(summary.locator('.failed-part')).toHaveText('1 hook');
+    await expect(summary.locator('.tool-status')).toHaveCount(0);
+    await expect(summary).toMatchAriaSnapshot('- text: 1 hook blocked');
   });
 }
