@@ -310,7 +310,7 @@ fn resolve_in(provider: &str, dirs: &[PathBuf]) -> Result<Executable, String> {
                 wsl: None,
             });
         }
-        // Resolve npm's Node entrypoint directly; never execute a shell shim with user arguments.
+        // Resolve npm's entrypoint directly; never execute a shell shim with user arguments.
         if cfg!(windows) && provider != "gemini" && dir.join(format!("{provider}.cmd")).is_file() {
             let package = match provider {
                 "codex" => "@openai/codex",
@@ -326,6 +326,18 @@ fn resolve_in(provider: &str, dirs: &[PathBuf]) -> Result<Executable, String> {
                     {
                         let script = root.join(bin);
                         if script.is_file() {
+                            // npm packages can expose a native binary instead of JavaScript.
+                            if script
+                                .extension()
+                                .is_some_and(|ext| ext.eq_ignore_ascii_case("exe"))
+                            {
+                                return Ok(Executable {
+                                    provider: provider.into(),
+                                    program: script,
+                                    prefix: vec![],
+                                    wsl: None,
+                                });
+                            }
                             if let Some(node) = dirs
                                 .iter()
                                 .map(|p| p.join("node.exe"))
