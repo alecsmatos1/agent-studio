@@ -2602,6 +2602,76 @@ mod tests {
         assert_eq!(data["conversation"][0]["text"], r.messages[0].text);
     }
     #[test]
+    #[cfg(windows)]
+    fn npm_entrypoints_run_native_binaries_directly_and_scripts_with_node() {
+        for (provider, package) in [
+            ("claude", "@anthropic-ai/claude-code"),
+            ("codex", "@openai/codex"),
+        ] {
+            for entrypoint in ["bin/cli.exe", "bin/cli.EXE", "cli.js", "cli.cjs", "cli.mjs"] {
+                for string_bin in [false, true] {
+                    let dir = tempfile::tempdir().unwrap();
+                    let npm = dir.path().join("npm with spaces");
+                    let root = npm.join("node_modules").join(package);
+                    let target = root.join(entrypoint);
+                    std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+                    std::fs::write(&target, "fixture").unwrap();
+                    std::fs::write(npm.join(format!("{provider}.cmd")), "unused shim").unwrap();
+                    let bin = if string_bin {
+                        serde_json::json!(entrypoint)
+                    } else {
+                        serde_json::json!({provider: entrypoint})
+                    };
+                    std::fs::write(
+                        root.join("package.json"),
+                        serde_json::json!({"bin": bin}).to_string(),
+                    )
+                    .unwrap();
+                    let dirs = vec![npm.clone()];
+                    let native = entrypoint.to_ascii_lowercase().ends_with(".exe");
+
+                    // A native npm entrypoint must work even when Node is absent.
+                    if native {
+                        let exe = resolve_in(provider, &dirs).unwrap();
+                        assert_eq!(exe.program, target);
+                        assert!(exe.prefix.is_empty());
+                        assert!(exe.wsl.is_none());
+                    } else {
+                        assert!(resolve_in(provider, &dirs).is_err());
+                    }
+
+                    let node_dir = dir.path().join("node with spaces");
+                    std::fs::create_dir(&node_dir).unwrap();
+                    let node = node_dir.join("node.exe");
+                    std::fs::write(&node, "fixture").unwrap();
+                    let dirs = vec![npm.clone(), node_dir];
+                    let exe = resolve_in(provider, &dirs).unwrap();
+                    assert_eq!(exe.provider, provider);
+                    assert!(exe.wsl.is_none());
+                    if native {
+                        assert_eq!(exe.program, target);
+                        assert!(exe.prefix.is_empty());
+                    } else {
+                        assert_eq!(exe.program, node);
+                        assert_eq!(exe.prefix, vec![target.to_string_lossy().into_owned()]);
+                    }
+
+                    // Do not launch a missing package entrypoint.
+                    std::fs::remove_file(&target).unwrap();
+                    assert!(resolve_in(provider, &dirs).is_err());
+
+                    // A native executable beside the npm shim keeps precedence.
+                    std::fs::write(&target, "fixture").unwrap();
+                    let standalone = npm.join(format!("{provider}.exe"));
+                    std::fs::write(&standalone, "fixture").unwrap();
+                    let exe = resolve_in(provider, &dirs).unwrap();
+                    assert_eq!(exe.program, standalone);
+                    assert!(exe.prefix.is_empty());
+                }
+            }
+        }
+    }
+    #[test]
     fn gemini_uses_antigravity_and_never_falls_back_to_legacy_cli() {
         let dir = tempfile::tempdir().unwrap();
         let executable = |name: &str| {
